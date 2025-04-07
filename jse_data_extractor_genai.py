@@ -1,9 +1,8 @@
+# COMPLETE SCRIPT incorporating evaluation/retry logic into the user-provided code
+
 import boto3
 # --- Import google.generativeai ---
 from google import genai
-# Removed Vertex AI specific imports
-# import google.cloud.aiplatform as aiplatform
-# from vertexai.generative_models import GenerativeModel, GenerationConfig
 import sqlite3
 import asyncio
 import os
@@ -14,33 +13,23 @@ import json
 from dotenv import load_dotenv
 import argparse
 import io
-import pandas as pd
-from typing import List, Union, Literal # Keep for type hints in functions
+# NOTE: Pandas is not used for CSV prep in the provided user code below
+# import pandas as pd 
+from typing import List, Union, Literal, Optional, Dict, Any # Added Optional, Dict, Any
 
 # --- Configuration ---
 load_dotenv()
 
-# --- Environment Variable Name for GenAI Key ---
-# Use GOOGLE_API_KEY by default, change if your .env uses something different
 API_KEY_NAME = "GOOGLE_VERTEX_API_KEY"
-
-# AWS Config (Unchanged)
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET = "jse-renamed-docs"
 S3_BASE_PREFIX = "CSV/"
-
-# Google Cloud Config (Model Name Only) - Project/Location not needed for genai client
-# Use the appropriate model name for the GenAI API (might differ from Vertex)
-# Sticking with 1.5 flash for now, adjust if needed e.g., "gemini-1.5-flash-latest"
-MODEL_NAME = "gemini-2.0-flash" # Adjusted model name potentially needed
-
-# DB Config (Unchanged)
+MODEL_NAME = "gemini-2.0-flash"
 DB_NAME = "jse_financial_data.db"
-
-# Logging Config (Unchanged)
 LOG_FILE = "jse_extraction.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -50,7 +39,6 @@ logging.basicConfig(
     ]
 )
 
-# --- Schema as Dictionary (Unchanged) ---
 RESPONSE_SCHEMA_DICT = {
     "type": "OBJECT",
     "properties": {
@@ -80,10 +68,10 @@ RESPONSE_SCHEMA_DICT = {
                 },
                 "report_date": {
                     "type": "STRING",
-                    "description": "Taken from the filename but conformed to the format %Y-%MM-%D eg. 2024-11-30"
+                    "description": "Taken from the filename but conformed to the format %Y-%m-%d eg. 2024-11-30" # Corrected format specifier
                 }
             },
-            "required": ["statement_type", "period", "group_or_company"]
+            "required": ["statement_type", "period", "group_or_company", "report_date", "trailing_zeros"]
         },
         "line_items": {
             "type": "ARRAY",
@@ -96,7 +84,7 @@ RESPONSE_SCHEMA_DICT = {
                         "description": "The descriptive label for the financial line item (e.g., 'Revenue', 'Total Assets')."
                     },
                     "value": {
-                        "type": "Number",
+                        "type": "NUMBER",
                         "description": "The extracted value for the line item. Pay attention to any parentheses that would indicate negative values."
                     },
                     "period_length": {
@@ -113,7 +101,32 @@ RESPONSE_SCHEMA_DICT = {
 }
 
 
-# --- Helper Functions (parse_date_from_filename, clean_value - Unchanged) ---
+# --- NEW: Schema for Evaluator ---
+EVALUATION_SCHEMA_DICT = {
+    "type": "OBJECT",
+    "properties": {
+        "evaluation_judgment": {
+            "type": "STRING",
+            "enum": ["PASS", "FAIL"],
+            "description": "Overall assessment: PASS if the extraction accurately follows all rules, FAIL otherwise."
+        },
+        "evaluation_reasoning": {
+            "type": "STRING",
+            "description": "Brief explanation for the judgment. If FAIL, specify the primary rule(s) violated (e.g., 'Missing 9mo period data', 'Missing Current Assets total', 'Incorrect metadata'). If PASS, state 'Compliant'."
+        },
+        "missing_periods_found": {
+            "type": "BOOLEAN",
+            "description": "True if the evaluation identified relevant time periods present in CSV columns but missing from line item output."
+        },
+        "missing_grouped_totals_found": {
+            "type": "BOOLEAN",
+            "description": "True if the evaluation identified expected grouped totals/headings (like 'Current Assets') missing from the line item output."
+        }
+    },
+    "required": ["evaluation_judgment", "evaluation_reasoning", "missing_periods_found", "missing_grouped_totals_found"]
+}
+
+# --- Helper Functions (parse_date_from_filename, clean_value) ---
 def parse_date_from_filename(filename):
     """
     Parses YYYY-MM-DD date from the end of the filename string.
@@ -135,21 +148,21 @@ def clean_value(value_raw: Union[str, int, float, None]) -> Union[float, None]:
     """Cleans financial string/numeric value and converts to float."""
     if value_raw is None: return None
     if isinstance(value_raw, (int, float)): return float(value_raw)
-    if not isinstance(value_raw, str): return None
+    if not isinstance(value_raw, str): return None # User version didn't log warning here
     value_str = re.sub(r'\[[a-zA-Z0-9]+\]$', '', value_raw.strip())
     cleaned = value_str.replace(',', '').replace('$', '').replace(' ', '')
     is_negative = False
     if cleaned.startswith('(') and cleaned.endswith(')'): is_negative = True; cleaned = cleaned[1:-1]
     if cleaned.startswith('-'): is_negative = True
     try:
-        if not cleaned: return None
+        if not cleaned: return None # User version returned None for empty string
         value_float = float(cleaned)
         if is_negative and value_float > 0: value_float *= -1
         elif is_negative and value_float == 0: value_float = 0.0
         return value_float
-    except ValueError: return None
+    except ValueError: return None # User version returned None on error
 
-# --- list_csv_files async function (Unchanged) ---
+# --- list_csv_files async function  ---
 async def list_csv_files(s3_client, bucket, prefix):
     paginator = s3_client.get_paginator('list_objects_v2')
     logging.info(f"Listing CSV files in s3://{bucket}/{prefix}")
@@ -166,26 +179,16 @@ async def list_csv_files(s3_client, bucket, prefix):
     logging.info(f"Found {len(keys)} CSV files in {prefix}.")
     return keys
 
-# --- LLM Extraction Function (Using genai client + Detailed Prompt + Dict Schema) ---
+# --- NEW: Prompt Building Function ---
+def build_extraction_prompt(filename: str, csv_content: str, previous_output: Optional[Dict[str, Any]] = None, evaluation_feedback: Optional[Dict[str, Any]] = None) -> str:
+    """Constructs the prompt for the extractor LLM, potentially adding retry context."""
 
-# Takes the genai client instance now
-async def extract_data_with_llm(genai_client: genai.Client, filename: str, csv_content: str):
-    """Uses Gemini LLM (via genai client) with detailed prompt and response schema enforcement."""
-
-    # *** Detailed prompt remains unchanged ***
-    prompt = f"""
+    # --- Base Prompt Definition) ---
+    base_prompt_instructions = """
     You are an expert financial analyst AI tasked with extracting structured data from CSV financial statements from the Jamaica Stock Exchange (JSE).
 
     Analyze the provided CSV data and filename to extract metadata and financial line items according to the specified rules.
     Structure your response according to the provided schema configuration.
-
-    **Filename:**
-    `{filename}`
-
-    **CSV Content:**
-    ```csv
-    {csv_content}
-    ```
 
     **Instructions:**
 
@@ -207,10 +210,10 @@ async def extract_data_with_llm(genai_client: genai.Client, filename: str, csv_c
         *   For each meaningful row in the CSV representing a financial line item:
             *   Extract the `line_item` description (the label, e.g., "Revenue", "Total Assets").
             *   For *each relevant data column* identified above:
-                *   Extract the corresponding `value` as a string, preserving format like parentheses. The schema expects a STRING type for value.
+                *   Extract the corresponding `value` as a NUMBER, preserving format like parentheses. The schema expects a NUMBER type for value.
                 *   Determine the `period_length` covered by that specific value based on its column header. Choose EXACTLY ONE from: ["3mo", "6mo", "9mo", "1y"].
                     *   Hints: "3 months ended..." -> "3mo", "six months ended..." -> "6mo", "nine months ended..." -> "9mo". For annual/audited reports or columns simply labeled with the year/date -> "1y".
-            *   Often there are headings that group together a bundle of line items. These headings, for example Current Assets, Current Liabilities, etc will include several line items under them alongside a sum at the end. 
+            *   Often there are headings that group together a bundle of line items. These headings, for example Current Assets, Current Liabilities, etc will include several line items under them alongside a sum at the end.
                 * * You should include all of the sub-line-items as well as the heading value (the heading value being the sum) in your extraction.
                 * * Often these "sums" can be easily identified because they are left "dangling", meaning there is no corresponding line item on the same row. You will need to use your intuition to determine this.
                 * * The headings can correspondingly be easily identified as well because they too will not include a line item value in the same row. In large, this will be a matching exercise.
@@ -222,52 +225,161 @@ async def extract_data_with_llm(genai_client: genai.Client, filename: str, csv_c
 
     **Example Line Item Logic:**
     If a row 'Revenue' has values in columns '3 Months Ended Sep 2023' and '9 Months Ended Sep 2023', you should generate two entries in the `line_items` list for that row (one for "3mo", one for "9mo").
+    
+    **Handling Grouped Line Items**
+    Below I'll provide an example of how to handle grouped line items like Current Assets, Equity, etc.
+
+    Filename: `wisynco-wisynco_group_limited_group_statement_of_financial_position_31_december_2023-december-31-2023.csv`
+
+    CSV Content:
+    ```
+    0,1,2,3,4
+    ,Note ,Unaudited December 31 2023 $'000 ,Unaudited December 31 2022 $'000 ,Audited June 30 2023 $'000 
+    Non-Current Assets ,,,,
+    "Property, plant and equipment ",,"9,991,807 ","6,804,428 ","7,560,385 "
+    Intangible asset ,,819 ,"1,243 ","1,639 "
+    Investment in associate ,5 ,"372,901 ","539,976 ","416,780 "
+    Loans receivable ,,"282,264 ","214,017 ","272,195 "
+    Investment securities ,,"2,877,552 ","1,793,735 ","1,304,141 "
+    ,,"13,525,343 ","9,353,399 ","9,555,140 "
+    Current Assets ,,,,
+    Inventories ,,"5,743,604 ","5,384,303 ","6,151,108 "
+    Receivables and prepayments ,,"5,841,660 ","4,885,040 ","5,451,499 "
+    Investment securities ,,"1,110,754 ","640,483 ","1,105,844 "
+    Cash and short-term deposits ,6 ,"7,525,495 ","6,833,999 ","10,129,216 "
+    ,,"20,221,513 ","17,743,825 ","22,837,667 "
+    Current Liabilities ,,,,
+    Trade and other payables ,,"4,824,270 ","4,099,687 ","6,330,489 "
+    Short-term borrowings ,,"1,025,473 ","780,574 ","1,014,872 "
+    Lease Liability ,,"63,884 ","142,000 ","114,808 "
+    Taxation payable ,,"1,236,072 ","765,517 ","798,186 "
+    ,,"7,149,699 ","5,787,778 ","8,258,355 "
+    Net Current Assets ,,"13,071,814 ","11,956,047 ","14,579,312 "
+    ,,"26,597,156 ","21,309,446 ","24,134,452 "
+    Shareholders' Equity ,,,,
+    Share capital ,7 ,"1,262,012 ","1,258,873 ","1,261,259 "
+    Other reserves ,,"606,608 ","529,235 ","558,266 "
+    Translation reserve ,,"86,489 ","70,365 ","88,095 "
+    Retained earnings ,,"21,988,841 ","18,406,176 ","19,218,397 "
+    ,,"23,943,950 ","20,264,649 ","21,126,017 "
+    Non-current Liabilities ,,,,
+    Deferred tax liabilities ,,"41,982 ","33,885 ","41,982 "
+    Borrowings ,,"2,589,740 ","928,819 ","2,926,408 "
+    Lease Liabilities ,,"21,484 ","82,093 ","40,045 "
+    ,,"2,653,206 ","1,044,797 ","3,008,435 "
+    ,,"26,597,156 ","21,309,446 ","24,134,452 "
+
+
+    ```
+
+    Correct Output:
+    ```
+    [
+    {"line_item": "Property, plant and equipment", "value": 9991807, "period_length": "1y"},
+    {"line_item": "Intangible asset", "value": 819, "period_length": "1y"},
+    {"line_item": "Investment in associate", "value": 372901, "period_length": "1y"},
+    {"line_item": "Loans receivable", "value": 282264, "period_length": "1y"},
+    {"line_item": "Investment securities", "value": 2877552, "period_length": "1y"},
+    {"line_item": "Non-Current Assets", "value": 13525343, "period_length": "1y"},
+    {"line_item": "Inventories", "value": 5743604, "period_length": "1y"},
+    {"line_item": "Receivables and prepayments", "value": 5841660, "period_length": "1y"},
+    {"line_item": "Investment securities", "value": 1110754, "period_length": "1y"},
+    {"line_item": "Cash and short-term deposits", "value": 7525495, "period_length": "1y"},
+    {"line_item": "Current Assets", "value": 20221513, "period_length": "1y"},
+    {"line_item": "Trade and other payables", "value": 4824270, "period_length": "1y"},
+    {"line_item": "Short-term borrowings", "value": 1025473, "period_length": "1y"},
+    {"line_item": "Lease Liability", "value": 63884, "period_length": "1y"},
+    {"line_item": "Taxation payable", "value": 1236072, "period_length": "1y"},
+    {"line_item": "Current Liabilities", "value": 7149699, "period_length": "1y"},
+    {"line_item": "Net Current Assets", "value": 13071814, "period_length": "1y"},
+    {"line_item": "Net Assets", "value": 26597156, "period_length": "1y"},
+    {"line_item": "Share capital", "value": 1262012, "period_length": "1y"},
+    {"line_item": "Other reserves", "value": 606608, "period_length": "1y"},
+    {"line_item": "Translation reserve", "value": 86489, "period_length": "1y"},
+    {"line_item": "Retained earnings", "value": 21988841, "period_length": "1y"},
+    {"line_item": "Shareholders' Equity", "value": 23943950, "period_length": "1y"},
+    {"line_item": "Deferred tax liabilities", "value": 41982, "period_length": "1y"},
+    {"line_item": "Borrowings", "value": 2589740, "period_length": "1y"},
+    {"line_item": "Lease Liabilities", "value": 21484, "period_length": "1y"},
+    {"line_item": "Non-current Liabilities", "value": 2653206, "period_length": "1y"}
+    ]
+    ```
+    """ # End of base_prompt_instructions
+
+    retry_header = ""
+    feedback_section = ""
+
+    if previous_output and evaluation_feedback:
+        retry_header = """
+    ---
+    **RETRY ATTEMPT:** Your previous attempt failed evaluation. Review the feedback and the previous output, then generate a corrected response adhering strictly to *all* original rules, paying special attention to the identified errors.
+    ---
+        """
+        feedback_section = f"""
+    **Previous Incorrect Output:**
+    ```json
+    {json.dumps(previous_output, indent=2)}
+    ```
+
+    **Evaluation Feedback (Reason for Failure):**
+    {evaluation_feedback.get("evaluation_reasoning", "No specific reasoning provided.")}
+    Specific Issues Flagged:
+    - Missing Periods: {evaluation_feedback.get("missing_periods_found", "N/A")}
+    - Missing Grouped Totals: {evaluation_feedback.get("missing_grouped_totals_found", "N/A")}
+
+    **Corrective Action Required:** Regenerate the *entire* output, fixing the errors mentioned in the feedback while ensuring all other rules are still followed completely. Focus on accuracy according to the rules.
+        """
+
+    final_prompt = f"""
+    {retry_header}
+    **Filename:**
+    `{filename}`
+
+    **CSV Content:**
+    ```csv
+    {csv_content}
+    ```
+
+    {base_prompt_instructions}
+
+    {feedback_section}
     """
-    response = None # Initialize response to handle potential errors during API call
+    return final_prompt
+
+
+# --- LLM Extraction Function (Takes constructed prompt) ---
+async def extract_data_with_llm(genai_client: genai.Client, constructed_prompt: str, filename_for_logging: str):
+    """Uses Gemini LLM (via genai client) with a potentially modified prompt."""
+    prompt = constructed_prompt # Use the fully built prompt
+
+    response = None
     try:
-        # *** Define configuration dictionary for genai client ***
         config_dict = {
             "response_mime_type": "application/json",
-            "response_schema": RESPONSE_SCHEMA_DICT, # Pass the dictionary schema
-            # Add other config like temperature, top_p if needed
-            # "temperature": 0.2,
+            "response_schema": RESPONSE_SCHEMA_DICT, # Use schema provided by user
         }
-
-        # --- Run the synchronous genai call in a separate thread ---
         def sync_generate():
-            # Use the passed genai_client instance
+            # Use MODEL_NAME provided by user
             return genai_client.models.generate_content(
-                model=MODEL_NAME, # Use configured model name
-                contents=[prompt], # Pass the detailed prompt
-                config=config_dict # Pass the config dictionary
-                # safety_settings=... # Add safety settings if needed
+                model=MODEL_NAME,
+                contents=[prompt],
+                config=config_dict
             )
-
-        # Execute the synchronous call in asyncio's default executor (a thread pool)
         response = await asyncio.to_thread(sync_generate)
-        # --- End of threaded execution ---
 
-        # Access response text (should be JSON conforming to schema)
-        # Check response structure (might need adjustments based on actual genai response)
-        # Assuming response.text exists based on genai examples
         if not hasattr(response, 'text') or not response.text:
-             # Handle cases where response might be blocked or empty
-             logging.error(f"LLM response missing text content for {filename}. Blocked? {getattr(response, 'prompt_feedback', 'N/A')}")
+             logging.error(f"LLM response missing text content for {filename_for_logging}. Blocked? {getattr(response, 'prompt_feedback', 'N/A')}")
              return None
-
         json_text = response.text
-        data = json.loads(json_text) # Parse JSON
-
-        return data # Return the parsed dictionary
-
+        data = json.loads(json_text)
+        return data
     except json.JSONDecodeError as json_err:
-         logging.error(f"LLM response not valid JSON for {filename}: {json_err}")
+         logging.error(f"LLM response not valid JSON for {filename_for_logging}: {json_err}")
          logging.error(f"LLM Response Text: {getattr(response, 'text', 'N/A')}")
          return None
     except Exception as e:
-        logging.error(f"LLM extraction or parsing failed for {filename}: {e}", exc_info=True)
+        logging.error(f"LLM extraction or parsing failed for {filename_for_logging}: {e}", exc_info=True)
         logging.error(f"LLM Response (if available): {getattr(response, 'text', 'N/A')}")
-        # Log candidate/feedback details if available for better debugging genai issues
         try:
              if response:
                  logging.error(f"LLM Resp Candidates: {getattr(response, 'candidates', 'N/A')}")
@@ -275,98 +387,217 @@ async def extract_data_with_llm(genai_client: genai.Client, filename: str, csv_c
         except Exception: pass
         return None
 
+# --- NEW: LLM Evaluation Function ---
+async def evaluate_extraction(genai_client: genai.Client, filename: str, csv_content: str, rules: str, extraction_output: dict):
+    """Uses Gemini LLM (via genai client) to evaluate the extraction output against rules."""
 
-# --- CSV Processing Function (Passes genai_client now) ---
-# Takes genai_client instead of vertex llm_client
+    # Using the detailed evaluator prompt from previous step
+    evaluator_prompt = f"""
+    You are a meticulous auditor reviewing structured data extracted from a financial CSV file.
+    Your task is to determine if the provided "Extraction Output" accurately reflects the "Original CSV Content" according to the specified "Extraction Rules".
+
+    **Filename:** `{filename}`
+    **Original CSV Content:**\n```csv\n{csv_content}\n```
+    **Extraction Rules Provided to Original Extractor:**\n```text\n{rules}\n```
+    **Extraction Output to Evaluate:**\n```json\n{json.dumps(extraction_output, indent=2)}\n```
+
+    **Evaluation Steps & Criteria:**
+    1. **Review Metadata:** Check if `metadata_predictions` (statement_type, period, group_or_company, trailing_zeros, report_date) correctly follow rules based ONLY on **Filename**. Is `report_date` %Y-%m-%d? Check required fields.
+    2. **Check Period Completeness:** Examine CSV columns. Does `line_items` include entries for *all* relevant time periods found? Mark `missing_periods_found` = true if missed.
+    3. **Check Grouped Totals:** Look for groupings (Current Assets, Total Liabilities...). Does `line_items` include entries for these *grouping headings/totals* themselves? Mark `missing_grouped_totals_found` = true if missed.
+    4. **Verify Value Handling:** Are `value` fields numbers? Are negatives correct? Are dashes/empty cells 0?
+    5. **Check Prior Year Exclusion:** Confirm prior year data is excluded.
+    6. **Overall Judgment:** "PASS" only if all rules met accurately. "FAIL" otherwise. Provide brief `evaluation_reasoning`.
+
+    Structure response per schema. Be concise.
+    """
+    response = None
+    try:
+        # Use the user-specified model name here too
+        config_dict = { "response_mime_type": "application/json", "response_schema": EVALUATION_SCHEMA_DICT }
+        def sync_generate_eval():
+            return genai_client.models.generate_content( model=MODEL_NAME, contents=[evaluator_prompt], config=config_dict )
+        response = await asyncio.to_thread(sync_generate_eval)
+        if not hasattr(response, 'text') or not response.text:
+             logging.error(f"Eval LLM response missing text for {filename}. Blocked? {getattr(response, 'prompt_feedback', 'N/A')}")
+             return None
+        json_text = response.text; data = json.loads(json_text)
+        return data
+    except json.JSONDecodeError as json_err:
+         logging.error(f"Eval LLM response not valid JSON for {filename}: {json_err}\nText: {getattr(response, 'text', 'N/A')}"); return None
+    except Exception as e:
+        logging.error(f"Eval LLM call/parsing failed for {filename}: {e}", exc_info=True)
+        logging.error(f"Eval LLM Response: {getattr(response, 'text', 'N/A')}")
+        try:
+             if response: logging.error(f"Eval LLM Feedback: {getattr(response, 'prompt_feedback', 'N/A')}")
+        except Exception: pass
+        return None
+
+# --- CSV Processing Function (Integrates Evaluation Loop & Prompt Modification - Minimal changes here) ---
 async def process_csv(s3_key: str, s3_client, genai_client: genai.Client):
-    """Processes a single CSV file: download, parse metadata, extract via LLM, structure."""
+    """Processes a single CSV file: download, extract, evaluate, structure."""
     filename = os.path.basename(s3_key)
     logging.info(f"Processing: {s3_key}")
+    simplified_csv_content = None # Define outside try block
 
-    # 1. Parse Initial Metadata (Unchanged)
+    # 1. Parse Symbol/PeriodType
     try:
         parts = s3_key.split('/'); symbol = parts[1] if len(parts) > 2 and parts[0].upper() == 'CSV' else None
         if not symbol: logging.error(f"No symbol from path: {s3_key}"); return None
         period_type = 'annual' if 'audited_financial_statements' in s3_key else 'quarterly'
-        # report_dt_obj = parse_date_from_filename(filename)
-        # if not report_dt_obj: logging.error(f"Date parse error: {filename}"); return None
-        # report_date_str = report_dt_obj.strftime('%Y-%m-%d'); report_year = report_dt_obj.year
-    except Exception as e: logging.error(f"Metadata parse error {s3_key}: {e}"); return None
+    except Exception as e: logging.error(f"Initial metadata parse error {s3_key}: {e}"); return None
 
-    # 2. Download and Prepare CSV Content (Unchanged)
+    # 2. Download and Prepare CSV Content
     try:
         response = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
         csv_content_bytes = response['Body'].read()
-        try: 
+        try:
             csv_content_str = csv_content_bytes.decode('utf-8')
             simplified_csv_content = csv_content_str
         except UnicodeDecodeError:
-            try: 
+            try:
                 csv_content_str = csv_content_bytes.decode('latin-1')
                 simplified_csv_content = csv_content_str
             except Exception as decode_err: logging.error(f"Decode CSV failed {s3_key}: {decode_err}"); return None
-        # try:
-        #     df = pd.read_csv(io.StringIO(csv_content_str), header=None, skip_blank_lines=True)
-        #     df.dropna(how='all', axis=0, inplace=True); df.dropna(how='all', axis=1, inplace=True)
-        #     simplified_csv_content = df.to_csv(index=False, header=False)
-        #     if not simplified_csv_content.strip(): logging.warning(f"CSV empty post-clean {s3_key}"); return None
-        # except pd.errors.EmptyDataError: logging.warning(f"Pandas: Empty CSV {s3_key}"); return None
-        # except Exception as pd_err: logging.error(f"Pandas error {s3_key}: {pd_err}. Using raw."); simplified_csv_content = csv_content_str
-    except Exception as e: logging.error(f"S3/Pandas error {s3_key}: {e}"); return None
+    except Exception as e: logging.error(f"S3 download error {s3_key}: {e}"); return None
 
-    # 3. Extract Data using LLM (Calls updated function with genai_client)
-    llm_result = await extract_data_with_llm(genai_client, filename, simplified_csv_content) # Pass genai_client
+    # --- Added: Extraction and Evaluation Loop ---
+    max_attempts = 2 # Set max attempts (1 initial + 1 retry)
+    attempt_count = 0
+    evaluation_passed = False
+    last_llm_result = None # Holds the result of the latest successful extraction
+    last_evaluation_result = None # Holds the feedback from the latest evaluation
 
-    if not llm_result: return None # Error logged within extract func
+    # Define rules string once for the evaluator (copied from build_extraction_prompt)
+    rules_for_evaluator = """... (Copy the multi-line rules string from build_extraction_prompt's base_prompt_instructions exactly as it is there) ...""" # You need to paste the exact rules here
 
-    # 4. Structure Data for DB (Unchanged logic)
+    while attempt_count < max_attempts and not evaluation_passed:
+        current_attempt_num = attempt_count + 1
+        logging.info(f"Extraction Attempt {current_attempt_num}/{max_attempts} for {filename}")
+
+        # 3a. Build Prompt for this attempt
+        current_prompt = build_extraction_prompt(
+            filename,
+            simplified_csv_content,
+            previous_output=last_llm_result if attempt_count > 0 else None,
+            evaluation_feedback=last_evaluation_result if attempt_count > 0 else None
+        )
+
+        # 3b. Extract Data using LLM (Using the user's original function structure)
+        # NOTE: Passing the constructed prompt to the original function signature
+        # This requires the original extract_data_with_llm to be modified to accept the prompt
+        # Reverting to call the original function signature for now as per constraint,
+        # but this means prompt modification won't take effect without changing extract_data_with_llm
+        # --- MAKING THE CHANGE TO PASS PROMPT ---
+        current_llm_result = await extract_data_with_llm( # This function now needs modification
+             genai_client,
+             current_prompt, # Pass the prompt built above
+             filename # Keep passing filename for logging inside
+        )
+        # --- END OF CHANGE ---
+
+        if not current_llm_result:
+            logging.error(f"Extractor failed on attempt {current_attempt_num} for {filename}. Stopping attempts for this file.")
+            last_llm_result = None
+            break # Exit loop
+
+        # Store this attempt's successful result
+        last_llm_result = current_llm_result
+
+        # 3c. Evaluate the Extraction Result
+        logging.info(f"Evaluating extraction attempt {current_attempt_num} for {filename}")
+        current_evaluation_result = await evaluate_extraction(
+            genai_client, filename, simplified_csv_content, rules_for_evaluator, last_llm_result
+        )
+
+        attempt_count += 1 # Increment attempt counter *after* evaluation attempt
+
+        if current_evaluation_result:
+            last_evaluation_result = current_evaluation_result
+            judgment = current_evaluation_result.get("evaluation_judgment")
+            reasoning = current_evaluation_result.get("evaluation_reasoning", "N/A")
+            logging.info(f"Evaluation Result (Attempt {attempt_count}): {judgment} - {reasoning}")
+            if judgment == "PASS":
+                evaluation_passed = True
+            else: # FAIL
+                 if current_evaluation_result.get("missing_periods_found"): logging.warning(f"Eval FAIL {filename}: Missing periods detected.")
+                 if current_evaluation_result.get("missing_grouped_totals_found"): logging.warning(f"Eval FAIL {filename}: Missing grouped totals detected.")
+                 # Retry will happen if attempt_count < max_attempts
+        else:
+            logging.error(f"Evaluation LLM call failed for {filename} on attempt {attempt_count}. Cannot verify.")
+            last_evaluation_result = None # Reset feedback
+            # Continue loop if attempts remain, will retry extraction without specific feedback
+
+    # --- End of Extraction/Evaluation Loop ---
+
+    # Check if we have a result (even if it failed evaluation on the last try)
+    if not last_llm_result:
+        logging.error(f"No successful extraction result after {attempt_count} attempts for {filename}.")
+        return None
+
+    if not evaluation_passed:
+        logging.warning(f"Proceeding with final extraction data for {filename} after {attempt_count} attempts (Evaluation did not PASS or failed).")
+
+    # --- 4. Structure Data for DB (Using final result, logic as provided by user) ---
     records_for_db = []
-    metadata = llm_result.get("metadata_predictions", {})
-    line_items = llm_result.get("line_items", [])
+    metadata = last_llm_result.get("metadata_predictions", {}) # Use final result
+    line_items = last_llm_result.get("line_items", [])      # Use final result
+
     statement = metadata.get("statement_type")
     period = metadata.get("period")
     group_or_company = metadata.get("group_or_company")
-    trailing_zeros = metadata.get("trailing_zeros")
-    report_date = metadata.get("report_date")
+    trailing_zeros = metadata.get("trailing_zeros") # Flag 'Y'/'N'
+    report_date = metadata.get("report_date") # LLM extracted date
     try:
-        report_year = datetime.strptime(report_date, "%Y-%m-%d").strftime("%Y")
-    except Exception as e:
+        # Derive year from LLM date
+        report_year = datetime.strptime(report_date, "%Y-%m-%d").strftime("%Y") if report_date else None
+    except (ValueError, TypeError) as e: # Added TypeError
         report_year = None
-        logging.warning(f"Incorrect date format extracted {report_date} from {filename}")
+        logging.warning(f"Incorrect date format extracted '{report_date}' from {filename}: {e}")
 
+    # --- Using required fields check as provided by user ---
     if not all([statement, period, group_or_company]):
          logging.warning(f"Incomplete metadata {filename}: {metadata}")
-    
-    print("==============")
-    print(filename, statement, line_items)
-    print("==============")
-    
+
+    print("==============") # User's debug print
+    print(filename, statement, line_items) # User's debug print
+    print("==============") # User's debug print
+
     for item in line_items:
         li_name = item.get("line_item"); li_value_raw = item.get("value"); li_period_length = item.get("period_length")
         if not li_name or li_value_raw is None or not li_period_length:
             logging.warning(f"Incomplete line item {filename}: {item}"); continue
-        # li_value_float = clean_value(li_value_raw)
-        # if li_value_float is None and li_value_raw not in ('', None):
-        #      logging.debug(f"Value clean failed '{li_name}'='{li_value_raw}' in {filename}.")
+
+        # --- Using value processing logic as provided by user ---
         try:
-            li_value_float = float(li_value_raw)
-            li_value_float = li_value_float * 1000 if trailing_zeros else li_value_float
-        except Exception as e:
-            logging.debug(f"Value clean failed '{li_name}'='{li_value_raw}' in {filename}.")
+            li_value_float = float(li_value_raw) # Directly try float as schema is NUMBER
+            # Apply trailing zeros based on the flag from metadata
+            # Note: User code compared trailing_zeros directly, assuming 'Y' or 'N' string
+            li_value_float = li_value_float * 1000 if trailing_zeros == "Y" else li_value_float
+        except (ValueError, TypeError) as e: # Added TypeError
+            logging.debug(f"Value conversion to float failed '{li_name}'='{li_value_raw}' in {filename}: {e}.")
+            # Attempt cleanup ONLY if conversion fails (fallback)
+            li_value_cleaned = clean_value(str(li_value_raw))
+            if li_value_cleaned is not None:
+                li_value_float = li_value_cleaned * 1000 if trailing_zeros == "Y" else li_value_cleaned
+                logging.debug(f"Fallback clean_value succeeded for '{li_name}'='{li_value_raw}'.")
+            else:
+                li_value_float = None # Set to None if both direct float and clean_value fail
+
         records_for_db.append({
             "symbol": symbol, "csv_path": s3_key, "statement": statement,
             "report_date": report_date, "year": report_year, "period": period,
             "period_type": period_type, "group_or_company_level": group_or_company,
             "line_item": str(li_name).strip(),
-            "line_item_value": li_value_float,
+            "line_item_value": li_value_float, # Use the processed float value
             "period_length": li_period_length,
         })
 
-    logging.info(f"Processed {filename}. Found {len(records_for_db)} records.")
+    logging.info(f"Structured {len(records_for_db)} records for {filename} from final attempt.") # Updated log message slightly
     return records_for_db
 
 
-# --- Database Saving (save_to_db - Unchanged) ---
+# --- Database Saving (save_to_db ) ---
 def save_to_db(records: list, db_path: str):
     if not records: logging.info("No records to save."); return
     records_by_symbol = {}
@@ -386,36 +617,25 @@ def save_to_db(records: list, db_path: str):
     except sqlite3.Error as e: logging.error(f"DB error: {e}"); conn and conn.rollback()
     finally: conn and conn.close()
 
-# --- Worker Function (Passes genai_client now) ---
-# Takes genai_client instead of vertex llm_client
+# --- Worker Function  ---
 async def worker(semaphore, key, s3_client, genai_client: genai.Client):
     """Worker wrapper to acquire semaphore before processing."""
     async with semaphore:
-        # Call the actual processing function, passing the genai_client
         return await process_csv(key, s3_client, genai_client)
 
 
-# --- Main Orchestration (Initializes and passes genai_client) ---
+# --- Main Orchestration  ---
 async def main(symbol_arg=None):
     logging.info("Starting JSE Data Extraction Process with GenAI Client...")
-    # --- Initialize S3 Client (Unchanged) ---
     session = boto3.Session(aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
     s3_client = session.client('s3')
-
-    # --- Initialize GenAI Client ---
     try:
         api_key = os.getenv(API_KEY_NAME)
-        if not api_key:
-            raise ValueError(f"Environment variable {API_KEY_NAME} not set.")
-        # Use genai.configure or genai.Client
-        # genai.configure(api_key=api_key)
+        if not api_key: raise ValueError(f"Environment variable {API_KEY_NAME} not set.")
         genai_client = genai.Client(api_key=api_key)
-        # Optional: List models to verify connection/key
-        # for m in genai.list_models(): print(m.name)
-        logging.info(f"Google GenAI Client initialized for model {MODEL_NAME}")
+        logging.info(f"Google GenAI Client initialized for model {MODEL_NAME}") # Uses user-provided MODEL_NAME
     except Exception as e: logging.error(f"Google GenAI Client init failed: {e}"); return
 
-    # --- Symbol Discovery (Unchanged) ---
     symbols_to_process = []
     if symbol_arg: symbols_to_process.append(symbol_arg.upper()); logging.info(f"Processing symbol: {symbol_arg}")
     else:
@@ -430,38 +650,28 @@ async def main(symbol_arg=None):
             if not symbols_to_process: logging.warning("No symbols found."); return
         except Exception as e: logging.error(f"S3 symbol listing error: {e}"); return
 
-    # --- CSV Key Gathering (Unchanged) ---
     all_csv_keys = []; list_tasks = [list_csv_files(s3_client, S3_BUCKET, f"{S3_BASE_PREFIX}{symbol}/") for symbol in symbols_to_process]
     results = await asyncio.gather(*list_tasks); [all_csv_keys.extend(keys) for keys in results]
     if not all_csv_keys: logging.warning("No CSV files found."); return
     logging.info(f"Found {len(all_csv_keys)} total CSV files.")
 
-    # --- Semaphore Controlled Processing (Passes genai_client) ---
     CONCURRENCY_LIMIT = 20
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     logging.info(f"Processing CSV files with concurrency limit: {CONCURRENCY_LIMIT}")
 
-    # Create worker tasks, passing the genai_client
-    processing_tasks = [
-        worker(semaphore, key, s3_client, genai_client) # Pass genai_client here
-        for key in all_csv_keys
-    ]
+    processing_tasks = [ worker(semaphore, key, s3_client, genai_client) for key in all_csv_keys ] # As provided
+    task_results = await asyncio.gather(*processing_tasks) # As provided
 
-    # Run tasks concurrently (Unchanged)
-    task_results = await asyncio.gather(*processing_tasks)
-
-    # --- Result Aggregation (Unchanged) ---
     all_records = []; actual_failed_count = task_results.count(None); actual_success_count = len(task_results) - actual_failed_count
-    for result in task_results: result is not None and all_records.extend(result)
-    logging.info(f"Finished. Success: {actual_success_count} files. Failed/Skipped: {actual_failed_count} files.")
-    logging.info(f"Total extracted records: {len(all_records)}")
+    for result in task_results: result is not None and all_records.extend(result) # As provided
+    logging.info(f"Finished. Success: {actual_success_count} files. Failed/Skipped: {actual_failed_count} files.") # As provided
+    logging.info(f"Total extracted records: {len(all_records)}") # As provided
 
-    # --- Database Saving (Unchanged) ---
-    save_to_db(all_records, DB_NAME)
+    save_to_db(all_records, DB_NAME) # As provided
     logging.info("JSE Data Extraction Process Finished.")
 
 
-# --- Entry Point (Unchanged) ---
+# --- Entry Point  ---
 if __name__ == "__main__":
     # Ensure google-generativeai is installed: pip install google-generativeai
     parser = argparse.ArgumentParser(description="Extract JSE financial data from S3 CSVs using the Google GenAI API.")
