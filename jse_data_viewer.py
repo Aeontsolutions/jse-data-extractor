@@ -46,7 +46,7 @@ def get_statements_for_year(db_path, symbol, year):
     table_name = f"jse_raw_{symbol}"
     try:
         conn = sqlite3.connect(db_path); cursor = conn.cursor()
-        cursor.execute(f"SELECT DISTINCT statement, report_date, period, period_type, group_or_company_level, csv_path FROM {table_name} WHERE year = ? ORDER BY report_date DESC, statement;", (year,))
+        cursor.execute(f"SELECT DISTINCT statement, report_date, period, period_type, group_or_company_level, csv_path, trailing_zeros FROM {table_name} WHERE year = ? ORDER BY report_date DESC, statement;", (year,))
         statements = [dict(zip([col[0] for col in cursor.description], row)) for row in cursor.fetchall()]
     except sqlite3.Error as e: messagebox.showerror("DB Error", f"Fetch statements failed for {symbol}/{year}: {e}")
     finally: conn and conn.close()
@@ -167,7 +167,7 @@ class JseDataViewerApp(tk.Tk):
         self.available_statements = get_statements_for_year(self.db_path, symbol, year)
         if self.available_statements:
             for idx, stmt_info in enumerate(self.available_statements):
-                 menu_label = f"{stmt_info['statement']} ({stmt_info['report_date']})"
+                 menu_label = f"{stmt_info['statement']} ({stmt_info['report_date']}) ({stmt_info['group_or_company_level']})"
                  self.statement_menu.add_command(label=menu_label, command=lambda index=idx: self.select_statement(index))
             self.menu_bar.entryconfig("Statement", state="normal")
         else: messagebox.showinfo("No Data", f"No statements found for {symbol} in {year}.")
@@ -184,7 +184,7 @@ class JseDataViewerApp(tk.Tk):
         metadata_text = (f"Symbol: {self.current_symbol.get()}\nYear: {self.current_year.get()}\n"
                          f"Statement: {md.get('statement', 'N/A')}\nReport Date: {md.get('report_date', 'N/A')}\n"
                          f"Period: {md.get('period', 'N/A')} ({md.get('period_type', 'N/A')})\nLevel: {md.get('group_or_company_level', 'N/A')}\n"
-                         f"Source: {os.path.basename(md.get('csv_path', 'N/A'))}")
+                         f"Source: {os.path.basename(md.get('csv_path', 'N/A'))}\nTrailing Zeros: {md.get('trailing_zeros', 'N/A')}\n")
         self.metadata_label.config(text=metadata_text)
 
         # 2. Display Line Items (Unchanged)
@@ -208,34 +208,19 @@ class JseDataViewerApp(tk.Tk):
 
     def update_csv_treeview(self, csv_content, csv_path):
         """Clears, configures, and populates the CSV Treeview."""
-        # --- Clear existing items first ---
-        for item in self.csv_tree.get_children():
-            self.csv_tree.delete(item)
-
-        # --- Attempt to Reset Columns and Headings ---
-        # Try deleting existing column definitions IF they exist
-        # This might still be tricky, but safer than setting to ()
-        try:
-             # Get current columns if any
-             current_cols = self.csv_tree['columns']
-             if current_cols:
-                 # Set columns to an empty list first, then redefine (more robust than '()')
-                 # No, let's avoid this. Let's just redefine directly below.
-
-                 # Reset headings associated with old columns before redefining columns
-                 for col in current_cols:
-                     self.csv_tree.heading(col, text="") # Clear heading text
-
-             # Reset the columns configuration to allow redefining
-             # self.csv_tree.configure(columns=[]) # Alternative way to try resetting
-             # Let's try just overwriting directly below when we have a header
-
-        except tk.TclError as e:
-             # This might occur if columns were already invalid, log it
-             logging.warning(f"TclError during pre-update column/heading reset (might be ok): {e}")
-        except Exception as e:
-             logging.warning(f"Error during pre-update column/heading reset: {e}")
-
+        # Destroy and recreate the CSV Treeview to avoid column configuration issues
+        self.csv_tree.destroy()
+        
+        # Create new Treeview
+        self.csv_tree = ttk.Treeview(self.right_frame, show='headings')
+        csv_vsb = ttk.Scrollbar(self.right_frame, orient="vertical", command=self.csv_tree.yview)
+        csv_hsb = ttk.Scrollbar(self.right_frame, orient="horizontal", command=self.csv_tree.xview)
+        self.csv_tree.configure(yscrollcommand=csv_vsb.set, xscrollcommand=csv_hsb.set)
+        
+        # Pack the new widgets
+        csv_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        csv_hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.csv_tree.pack(expand=True, fill=tk.BOTH)
 
         # --- Handle No Content ---
         if csv_content is None:
@@ -271,7 +256,6 @@ class JseDataViewerApp(tk.Tk):
                 return
 
             # --- Directly set the new columns and headings ---
-            # This replaces the previous column definition entirely
             self.csv_tree['columns'] = tuple(header)
             self.csv_tree['displaycolumns'] = tuple(header) # Or '#all'
 
@@ -282,12 +266,12 @@ class JseDataViewerApp(tk.Tk):
             # Insert data rows
             for row_num, row in enumerate(reader):
                 if len(row) == len(header):
-                     self.csv_tree.insert("", tk.END, values=row)
+                    self.csv_tree.insert("", tk.END, values=row)
                 else:
-                     logging.warning(f"Skipping malformed row {row_num+2} in {csv_path}: Expected {len(header)} cols, got {len(row)}")
-                     # Handle padding if necessary, but skipping might be safer
-                     # padded_row = row[:len(header)] + [''] * (len(header) - len(row))
-                     # self.csv_tree.insert("", tk.END, values=padded_row)
+                    logging.warning(f"Skipping malformed row {row_num+2} in {csv_path}: Expected {len(header)} cols, got {len(row)}")
+                    # Handle padding if necessary, but skipping might be safer
+                    # padded_row = row[:len(header)] + [''] * (len(header) - len(row))
+                    # self.csv_tree.insert("", tk.END, values=padded_row)
 
 
         except csv.Error as e:

@@ -576,13 +576,13 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client):
             li_value_float = float(li_value_raw) # Directly try float as schema is NUMBER
             # Apply trailing zeros based on the flag from metadata
             # Note: User code compared trailing_zeros directly, assuming 'Y' or 'N' string
-            li_value_float = li_value_float * 1000 if trailing_zeros == "Y" else li_value_float
+            # li_value_float = li_value_float * 1000 if trailing_zeros == "Y" else li_value_float
         except (ValueError, TypeError) as e: # Added TypeError
             logging.debug(f"Value conversion to float failed '{li_name}'='{li_value_raw}' in {filename}: {e}.")
             # Attempt cleanup ONLY if conversion fails (fallback)
             li_value_cleaned = clean_value(str(li_value_raw))
             if li_value_cleaned is not None:
-                li_value_float = li_value_cleaned * 1000 if trailing_zeros == "Y" else li_value_cleaned
+                # li_value_float = li_value_cleaned * 1000 if trailing_zeros == "Y" else li_value_cleaned
                 logging.debug(f"Fallback clean_value succeeded for '{li_name}'='{li_value_raw}'.")
             else:
                 li_value_float = None # Set to None if both direct float and clean_value fail
@@ -594,6 +594,7 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client):
             "line_item": str(li_name).strip(),
             "line_item_value": li_value_float, # Use the processed float value
             "period_length": li_period_length,
+            "trailing_zeros": trailing_zeros
         })
 
     logging.info(f"Structured {len(records_for_db)} records for {filename} from final attempt.") # Updated log message slightly
@@ -612,9 +613,9 @@ def save_to_db(records: list, db_path: str):
         for symbol, symbol_records in records_by_symbol.items():
             table_name = f"jse_raw_{symbol}"
             logging.info(f"Saving {len(symbol_records)} records for '{symbol}' to '{table_name}'")
-            cursor.execute(f"""CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, csv_path TEXT, statement TEXT, report_date DATE, year INTEGER, period TEXT, period_type TEXT, group_or_company_level TEXT, line_item TEXT, line_item_value REAL, period_length TEXT, extraction_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE(csv_path, line_item, period_length))""")
-            insert_data = [(r['symbol'], r['csv_path'], r['statement'], r['report_date'], r['year'], r['period'], r['period_type'], r['group_or_company_level'], r['line_item'], r['line_item_value'], r['period_length']) for r in symbol_records]
-            cursor.executemany(f"""INSERT INTO {table_name} (symbol, csv_path, statement, report_date, year, period, period_type, group_or_company_level, line_item, line_item_value, period_length) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(csv_path, line_item, period_length) DO UPDATE SET statement=excluded.statement, report_date=excluded.report_date, year=excluded.year, period=excluded.period, period_type=excluded.period_type, group_or_company_level=excluded.group_or_company_level, line_item_value=excluded.line_item_value, extraction_timestamp=CURRENT_TIMESTAMP""", insert_data)
+            cursor.execute(f"""CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, csv_path TEXT, statement TEXT, report_date DATE, year INTEGER, period TEXT, period_type TEXT, group_or_company_level TEXT, line_item TEXT, line_item_value REAL, period_length TEXT, extraction_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, trailing_zeros TEXT, UNIQUE(csv_path, line_item, period_length))""")
+            insert_data = [(r['symbol'], r['csv_path'], r['statement'], r['report_date'], r['year'], r['period'], r['period_type'], r['group_or_company_level'], r['line_item'], r['line_item_value'], r['period_length'], r['trailing_zeros']) for r in symbol_records]
+            cursor.executemany(f"""INSERT INTO {table_name} (symbol, csv_path, statement, report_date, year, period, period_type, group_or_company_level, line_item, line_item_value, period_length, trailing_zeros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(csv_path, line_item, period_length) DO UPDATE SET statement=excluded.statement, report_date=excluded.report_date, year=excluded.year, period=excluded.period, period_type=excluded.period_type, group_or_company_level=excluded.group_or_company_level, line_item_value=excluded.line_item_value, extraction_timestamp=CURRENT_TIMESTAMP, trailing_zeros=excluded.trailing_zeros""", insert_data)
         conn.commit()
         logging.info(f"Saved data for {len(records_by_symbol)} symbols.")
     except sqlite3.Error as e: logging.error(f"DB error: {e}"); conn and conn.rollback()
