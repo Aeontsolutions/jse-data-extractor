@@ -217,6 +217,9 @@ def build_extraction_prompt(filename: str, csv_content: str, previous_output: Op
                 * * You should include all of the sub-line-items as well as the heading value (the heading value being the sum) in your extraction.
                 * * Often these "sums" can be easily identified because they are left "dangling", meaning there is no corresponding line item on the same row. You will need to use your intuition to determine this.
                 * * The headings can correspondingly be easily identified as well because they too will not include a line item value in the same row. In large, this will be a matching exercise.
+            *   Cropped line items are often present. These can be in the case of "Net Profits Attributable To:" for example where one or 2 rows proceed, both of which have some value.
+                *   In this case, the correct approach is not to create a line item `Net Profits Attributable To:`, however to join it with each of the proceeding rows.
+                *   In the scenario I described above there are 3 rows, one being cropped. The final output would be 2 rows.
     3. **Simple Rules to follows:**
         * Line item values should never be NULL. If you see a dash where a value should be you should enter 0 for the value.
         * You should pay attention to whether there are indications of whether or not a value is negative. This can be indicated by the use of parentheses for instance.
