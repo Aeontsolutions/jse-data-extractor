@@ -225,7 +225,8 @@ def build_extraction_prompt(filename: str, csv_content: str, previous_output: Op
         * You should pay attention to whether there are indications of whether or not a value is negative. This can be indicated by the use of parentheses for instance.
         * Use some common sense here and there - if the date indicated by the filename is 2024 for example, you should really only be paying attention to columns for 2024.
         * Whenever a column just says `Quarter Ended` without specifying a length of time you can assume that it is for a length of `3mo`. These data points should certainly be included.
-
+        * It is __exceedingly__ important that no line items are missed and that you are exhaustive in your coverage.
+        * Needless to say, imaginary line items are also unacceptable.
     **Example Line Item Logic:**
     If a row 'Revenue' has values in columns '3 Months Ended Sep 2023' and '9 Months Ended Sep 2023', you should generate two entries in the `line_items` list for that row (one for "3mo", one for "9mo").
     
@@ -410,7 +411,8 @@ async def evaluate_extraction(genai_client: genai.Client, filename: str, csv_con
     3. **Check Grouped Totals:** Look for groupings (Current Assets, Total Liabilities...). Does `line_items` include entries for these *grouping headings/totals* themselves? Mark `missing_grouped_totals_found` = true if missed.
     4. **Verify Value Handling:** Are `value` fields numbers? Are negatives correct? Are dashes/empty cells 0?
     5. **Check Prior Year Exclusion:** Confirm prior year data is excluded.
-    6. **Overall Judgment:** "PASS" only if all rules met accurately. "FAIL" otherwise. Provide brief `evaluation_reasoning`.
+    6  **Verify Line Item Coverage Completeness:** Ensure no line items from the original CSV content is missed. This is __very__ important.
+    7. **Overall Judgment:** "PASS" only if all rules met accurately. "FAIL" otherwise. Provide brief `evaluation_reasoning`.
 
     Structure response per schema. Be concise.
     """
