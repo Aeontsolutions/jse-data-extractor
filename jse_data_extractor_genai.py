@@ -449,7 +449,7 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client):
     try:
         parts = s3_key.split('/'); symbol = parts[1] if len(parts) > 2 and parts[0].upper() == 'CSV' else None
         if not symbol: logging.error(f"No symbol from path: {s3_key}"); return None
-        period_type = 'annual' if 'audited_financial_statements' in s3_key else 'quarterly'
+        period_type = 'quarterly' if 'unaudited_financial_statements' in s3_key else 'annual'
     except Exception as e: logging.error(f"Initial metadata parse error {s3_key}: {e}"); return None
 
     # 2. Download and Prepare CSV Content
@@ -639,41 +639,76 @@ async def main(symbol_arg=None):
         api_key = os.getenv(API_KEY_NAME)
         if not api_key: raise ValueError(f"Environment variable {API_KEY_NAME} not set.")
         genai_client = genai.Client(api_key=api_key)
-        logging.info(f"Google GenAI Client initialized for model {MODEL_NAME}") # Uses user-provided MODEL_NAME
-    except Exception as e: logging.error(f"Google GenAI Client init failed: {e}"); return
+        logging.info(f"Google GenAI Client initialized for model {MODEL_NAME}")
+    except Exception as e: 
+        logging.error(f"Google GenAI Client init failed: {e}")
+        return
 
     symbols_to_process = []
-    if symbol_arg: symbols_to_process.append(symbol_arg.upper()); logging.info(f"Processing symbol: {symbol_arg}")
+    if symbol_arg: 
+        symbols_to_process.append(symbol_arg.upper())
+        logging.info(f"Processing symbol: {symbol_arg}")
     else:
         logging.info(f"Listing symbols in s3://{S3_BUCKET}/{S3_BASE_PREFIX}")
         paginator = s3_client.get_paginator('list_objects_v2')
         try:
             response_iterator = paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_BASE_PREFIX, Delimiter='/')
             for page in response_iterator:
-                 for prefix_data in page.get('CommonPrefixes', []):
-                    prefix = prefix_data.get('Prefix'); symbol = prefix.replace(S3_BASE_PREFIX, '', 1).strip('/') if prefix else None; symbol and symbols_to_process.append(symbol.upper())
+                for prefix_data in page.get('CommonPrefixes', []):
+                    prefix = prefix_data.get('Prefix')
+                    symbol = prefix.replace(S3_BASE_PREFIX, '', 1).strip('/') if prefix else None
+                    symbol and symbols_to_process.append(symbol.upper())
+            # Sort symbols alphabetically
+            symbols_to_process.sort()
             logging.info(f"Found symbols: {symbols_to_process}")
-            if not symbols_to_process: logging.warning("No symbols found."); return
-        except Exception as e: logging.error(f"S3 symbol listing error: {e}"); return
+            if not symbols_to_process: 
+                logging.warning("No symbols found.")
+                return
+        except Exception as e: 
+            logging.error(f"S3 symbol listing error: {e}")
+            return
 
-    all_csv_keys = []; list_tasks = [list_csv_files(s3_client, S3_BUCKET, f"{S3_BASE_PREFIX}{symbol}/") for symbol in symbols_to_process]
-    results = await asyncio.gather(*list_tasks); [all_csv_keys.extend(keys) for keys in results]
-    if not all_csv_keys: logging.warning("No CSV files found."); return
-    logging.info(f"Found {len(all_csv_keys)} total CSV files.")
-
-    CONCURRENCY_LIMIT = 20
+    CONCURRENCY_LIMIT = 40
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    logging.info(f"Processing CSV files with concurrency limit: {CONCURRENCY_LIMIT}")
 
-    processing_tasks = [ worker(semaphore, key, s3_client, genai_client) for key in all_csv_keys ] # As provided
-    task_results = await asyncio.gather(*processing_tasks) # As provided
-
-    all_records = []; actual_failed_count = task_results.count(None); actual_success_count = len(task_results) - actual_failed_count
-    for result in task_results: result is not None and all_records.extend(result) # As provided
-    logging.info(f"Finished. Success: {actual_success_count} files. Failed/Skipped: {actual_failed_count} files.") # As provided
-    logging.info(f"Total extracted records: {len(all_records)}") # As provided
-
-    save_to_db(all_records, DB_NAME) # As provided
+    symbols_to_process = [s for s in symbols_to_process if s.lower() >= "lab"]
+    
+    # Process each symbol sequentially but process files within each symbol concurrently
+    for symbol in symbols_to_process:
+        logging.info(f"Processing symbol: {symbol}")
+        symbol_prefix = f"{S3_BASE_PREFIX}{symbol}/"
+        
+        # Get CSV files for this symbol
+        try:
+            csv_keys = await list_csv_files(s3_client, S3_BUCKET, symbol_prefix)
+            if not csv_keys:
+                logging.warning(f"No CSV files found for symbol {symbol}.")
+                continue
+            logging.info(f"Found {len(csv_keys)} CSV files for symbol {symbol}.")
+            
+            # Process all files for this symbol concurrently
+            processing_tasks = [worker(semaphore, key, s3_client, genai_client) for key in csv_keys]
+            task_results = await asyncio.gather(*processing_tasks)
+            
+            # Collect results for this symbol
+            symbol_records = []
+            failed_count = task_results.count(None)
+            success_count = len(task_results) - failed_count
+            for result in task_results:
+                if result is not None:
+                    symbol_records.extend(result)
+            
+            logging.info(f"Finished {symbol}. Success: {success_count} files. Failed/Skipped: {failed_count} files.")
+            logging.info(f"Extracted records for {symbol}: {len(symbol_records)}")
+            
+            # Save this symbol's data to the database immediately
+            if symbol_records:
+                save_to_db(symbol_records, DB_NAME)
+                logging.info(f"Saved {len(symbol_records)} records for symbol {symbol} to database.")
+            
+        except Exception as e:
+            logging.error(f"Error processing symbol {symbol}: {e}")
+    
     logging.info("JSE Data Extraction Process Finished.")
 
 
