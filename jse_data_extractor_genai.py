@@ -29,6 +29,8 @@ S3_BASE_PREFIX = "CSV/"
 MODEL_NAME = "gemini-2.0-flash"
 DB_NAME = "jse_financial_data.db"
 LOG_FILE = "jse_extraction.log"
+STATEMENT_MAPPING_CSV=os.getenv("STATEMENT_MAPPING_CSV_PATH")
+CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -126,6 +128,28 @@ EVALUATION_SCHEMA_DICT = {
     "required": ["evaluation_judgment", "evaluation_reasoning", "missing_periods_found", "missing_grouped_totals_found"]
 }
 
+# --- NEW: Schema for Group Level Determination ---
+GROUP_LEVEL_SCHEMA_DICT = {
+    "type": "OBJECT",
+    "properties": {
+        "group_level_determination": {
+            "type": "STRING",
+            "enum": ["group", "company"],
+            "description": "The determined level of the financial statement: group (consolidated) or company."
+        },
+        "confidence": {
+            "type": "STRING",
+            "enum": ["high", "medium", "low"],
+            "description": "The confidence level in the determination."
+        },
+        "reasoning": {
+            "type": "STRING",
+            "description": "Brief explanation for the determination, referencing specific evidence from the file name or contents."
+        }
+    },
+    "required": ["group_level_determination", "confidence", "reasoning"]
+}
+
 # --- Helper Functions (parse_date_from_filename, clean_value) ---
 def parse_date_from_filename(filename):
     """
@@ -178,6 +202,158 @@ async def list_csv_files(s3_client, bucket, prefix):
     except Exception as e: logging.error(f"S3 listing error {bucket}/{prefix}: {e}")
     logging.info(f"Found {len(keys)} CSV files in {prefix}.")
     return keys
+
+# --- NEW: Function to load and process statement mapping CSV ---
+def load_statement_mapping(csv_content_str):
+    """Load and process financial statement mapping data."""
+    mapping_data = {}
+    
+    try:
+        # Use StringIO to treat the string as a file-like object
+        csv_io = io.StringIO(csv_content_str)
+        
+        # Parse the CSV using csv module
+        import csv
+        reader = csv.DictReader(csv_io)
+        
+        # Group by symbol
+        for row in reader:
+            symbol = row.get('Symbol')
+            if not symbol:
+                continue
+                
+            if symbol not in mapping_data:
+                mapping_data[symbol] = []
+                
+            # Add entry to the list for this symbol
+            # Note: The 'Associated Title Key Words' column might literally contain the string "None"
+            keywords = row.get('Associated Title Key Words', '')
+            
+            mapping_data[symbol].append({
+                'company': row.get('Company', ''),
+                'report_type': row.get('Report Type', ''),
+                'statement_type': row.get('Statement Type', ''),
+                'keywords': keywords,  # Store the actual string value, including "None" if present
+                'annual_period_start': row.get('Annual Period Start', ''),
+                'annual_period_end': row.get('Annual Period End', ''),
+                'note': row.get('Note', '')
+            })
+            
+        return mapping_data
+        
+    except Exception as e:
+        logging.error(f"Error processing statement mapping CSV: {e}")
+        return {}
+
+# --- NEW: Function to determine if LLM is needed for group level determination ---
+def needs_llm_determination(symbol, mapping_data):
+    """
+    Determine if a symbol needs LLM for group vs company determination.
+    Returns (needs_llm, keywords_list) tuple.
+    """
+    if symbol not in mapping_data:
+        # No mapping data for this symbol, default to using original determination
+        return False, []
+        
+    entries = mapping_data[symbol]
+    keywords_set = {entry['keywords'] for entry in entries}
+    
+    # If all keywords are the literal string "None", use deterministic company level
+    if keywords_set == {'None'} or (len(keywords_set) == 1 and "None" in keywords_set):
+        return False, []
+        
+    # Otherwise, we need LLM determination with available keywords
+    # Exclude the literal "None" string entries
+    keywords_list = [kw for kw in keywords_set if kw != "None" and kw]
+    return True, keywords_list
+
+# --- NEW: Function to build group level determination prompt ---
+def build_group_level_prompt(filename, csv_content, keywords_list):
+    """Build prompt for determining group vs company level using LLM."""
+    
+    prompt = f"""
+    You are a financial data analyst specializing in determining whether financial statements are at the GROUP (consolidated) level or COMPANY level.
+    Additional context: All the listings you are being presented with are for conglomerates so don't be surprised if "group" is present within the filenames.
+    Additional context cont'd: Your job is in distinguishing with of the statements for this GROUP is at the company or group/consolidated level
+    Additional context cont'd: This requires you to use your smarts - if the company name has group in it but the statement file has "company statement" in there then it's clearly a Company Statement
+
+    
+    **Filename:** `{filename}`
+    
+    **CSV Content (sample):**
+    ```csv
+    {csv_content[:2000]}  
+    ```
+    
+    **Keywords Associated with GROUP (Consolidated) Statements for this Company:**
+    {', '.join(keywords_list)}
+    
+    **Instructions:**
+    
+    1. Analyze both the FILENAME and SAMPLE CONTENT of the CSV to determine if this is a GROUP-level (consolidated) or COMPANY-level financial statement.
+    
+    2. Look for specific indicators:
+       - In FILENAME: Terms like "group", "consolidated", or any of the keywords listed above.
+       - In FILANAME: The keyword proximity to the word "statement" aids a lot in determining whether it's a group or company-level line statement
+       - In CSV CONTENT: Headers or titles containing "group", "consolidated", or references to consolidated statements.
+       - Table structure and column headers that suggest group vs company reporting.
+    
+    3. Provide your determination as either "group" or "company", your confidence level, and your reasoning.
+    
+    4. If there are conflicting signals, prioritize:
+       a) Explicit mention of "consolidated" or "group" in the filename or header rows
+       b) Presence of the keywords provided above
+       c) Structure of the data (e.g., parent-subsidiary breakdowns indicate group level)
+    
+    5. Important: Make sure your determination is based ONLY on the filename and CSV content, not on other metadata like statement type.
+
+    6. Caveats: Often a filename can have the word `group` in there but what you're really looking for in the filename and content is whether it says "group/consolidated STATEMENT" or "company STATEMENT". That's really what determines the level. So, again, if present use the [KEYWORD] Statement pattern.
+    
+    Return your analysis in the specified JSON format.
+    """
+    
+    return prompt
+
+# --- NEW: Function to determine group level using LLM ---
+async def determine_group_level_with_llm(genai_client, filename, csv_content, keywords_list):
+    """Uses Gemini LLM to determine if a statement is at group or company level."""
+    
+    prompt = build_group_level_prompt(filename, csv_content, keywords_list)
+    
+    try:
+        config_dict = {
+            "response_mime_type": "application/json",
+            "response_schema": GROUP_LEVEL_SCHEMA_DICT,
+        }
+        
+        def sync_generate():
+            return genai_client.models.generate_content(
+                model=MODEL_NAME,
+                contents=[prompt],
+                config=config_dict
+            )
+            
+        response = await asyncio.to_thread(sync_generate)
+        
+        if not hasattr(response, 'text') or not response.text:
+            logging.error(f"Group level LLM response missing text for {filename}.")
+            return "group"  # Default to group if LLM fails
+            
+        json_text = response.text
+        data = json.loads(json_text)
+        
+        group_level = data.get("group_level_determination", "group")
+        confidence = data.get("confidence", "low")
+        reasoning = data.get("reasoning", "No reasoning provided")
+        
+        logging.info(f"Group level determined for {filename}: {group_level} (confidence: {confidence})\nReasoning: {reasoning}")
+        # logging.debug(f"Group level reasoning: {reasoning}")
+        
+        return group_level
+        
+    except Exception as e:
+        logging.error(f"Group level determination failed for {filename}: {e}", exc_info=True)
+        return "group"  # Default to group if LLM fails
 
 # --- NEW: Prompt Building Function ---
 def build_extraction_prompt(filename: str, csv_content: str, previous_output: Optional[Dict[str, Any]] = None, evaluation_feedback: Optional[Dict[str, Any]] = None) -> str:
@@ -439,7 +615,7 @@ async def evaluate_extraction(genai_client: genai.Client, filename: str, csv_con
         return None
 
 # --- CSV Processing Function (Integrates Evaluation Loop & Prompt Modification - Minimal changes here) ---
-async def process_csv(s3_key: str, s3_client, genai_client: genai.Client):
+async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mapping_data=None):
     """Processes a single CSV file: download, extract, evaluate, structure."""
     filename = os.path.basename(s3_key)
     logging.info(f"Processing: {s3_key}")
@@ -550,9 +726,44 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client):
 
     statement = metadata.get("statement_type")
     period = metadata.get("period")
-    group_or_company = metadata.get("group_or_company")
+    
+    # Original group_or_company from LLM extraction
+    original_group_or_company = metadata.get("group_or_company")
+    
     trailing_zeros = metadata.get("trailing_zeros") # Flag 'Y'/'N'
     report_date = metadata.get("report_date") # LLM extracted date
+    
+    # --- NEW: Determine group or company level using mapping data ---
+    # Default to the original determination
+    group_or_company = original_group_or_company
+    
+    if mapping_data and symbol in mapping_data:
+        # Check if we need LLM determination for this symbol
+        needs_llm, keywords_list = needs_llm_determination(symbol, mapping_data)
+        
+        if not needs_llm:
+            # Deterministic case: If all keywords are the literal string "None", set to company level
+            group_or_company = "company"
+            logging.info(f"Deterministic group level for {symbol}: company (all keywords are literal 'None')")
+        elif keywords_list:
+            # Use LLM to determine group level only if we have meaningful keywords
+            logging.info(f"Using LLM to determine group level for {filename} with keywords: {keywords_list}")
+            group_or_company = await determine_group_level_with_llm(
+                genai_client, 
+                filename, 
+                simplified_csv_content, 
+                keywords_list
+            )
+        else:
+            # No meaningful keywords but not all "None" - use original determination
+            logging.info(f"No meaningful keywords for {symbol}, using original determination: {original_group_or_company}")
+    else:
+        logging.info(f"No mapping data for {symbol}, using original determination: {original_group_or_company}")
+    
+    # Log if determination changed
+    if group_or_company != original_group_or_company:
+        logging.info(f"Group level changed for {filename}: {original_group_or_company} -> {group_or_company}")
+    
     try:
         # Derive year from LLM date
         report_year = datetime.strptime(report_date, "%Y-%m-%d").strftime("%Y") if report_date else None
@@ -592,7 +803,7 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client):
         records_for_db.append({
             "symbol": symbol, "csv_path": s3_key, "statement": statement,
             "report_date": report_date, "year": report_year, "period": period,
-            "period_type": period_type, "group_or_company_level": group_or_company,
+            "period_type": period_type, "group_or_company_level": group_or_company, # Updated with new determination
             "line_item": str(li_name).strip(),
             "line_item_value": li_value_float, # Use the processed float value
             "period_length": li_period_length,
@@ -624,17 +835,18 @@ def save_to_db(records: list, db_path: str):
     finally: conn and conn.close()
 
 # --- Worker Function  ---
-async def worker(semaphore, key, s3_client, genai_client: genai.Client):
+async def worker(semaphore, key, s3_client, genai_client: genai.Client, mapping_data=None):
     """Worker wrapper to acquire semaphore before processing."""
     async with semaphore:
-        return await process_csv(key, s3_client, genai_client)
+        return await process_csv(key, s3_client, genai_client, mapping_data)
 
 
 # --- Main Orchestration  ---
-async def main(symbol_arg=None):
+async def main(symbol_arg=None, mapping_csv_path=None):
     logging.info("Starting JSE Data Extraction Process with GenAI Client...")
     session = boto3.Session(aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
     s3_client = session.client('s3')
+    
     try:
         api_key = os.getenv(API_KEY_NAME)
         if not api_key: raise ValueError(f"Environment variable {API_KEY_NAME} not set.")
@@ -644,6 +856,33 @@ async def main(symbol_arg=None):
         logging.error(f"Google GenAI Client init failed: {e}")
         return
 
+    # Load mapping data if provided
+    mapping_data = None
+    if mapping_csv_path:
+        try:
+            with open(mapping_csv_path, 'r', encoding='utf-8') as f:
+                mapping_csv_content = f.read()
+            mapping_data = load_statement_mapping(mapping_csv_content)
+            logging.info(f"Loaded statement mapping data for {len(mapping_data)} symbols.")
+            
+            # Log some stats about mapping data for debugging
+            all_none_symbols = []
+            llm_needed_symbols = []
+            
+            for symbol, entries in mapping_data.items():
+                needs_llm, keywords = needs_llm_determination(symbol, mapping_data)
+                if not needs_llm:
+                    all_none_symbols.append(symbol)
+                elif keywords:
+                    llm_needed_symbols.append(symbol)
+            
+            logging.info(f"Symbols with all 'None' keywords (will use company level): {len(all_none_symbols)}")
+            logging.info(f"Symbols requiring LLM group level determination: {len(llm_needed_symbols)}")
+            
+        except Exception as e:
+            logging.error(f"Failed to load mapping CSV from {mapping_csv_path}: {e}")
+            # Continue without mapping data
+    
     symbols_to_process = []
     if symbol_arg: 
         symbols_to_process.append(symbol_arg.upper())
@@ -668,7 +907,6 @@ async def main(symbol_arg=None):
             logging.error(f"S3 symbol listing error: {e}")
             return
 
-    CONCURRENCY_LIMIT = 40
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
     symbols_to_process = [s for s in symbols_to_process if s.lower() >= "lab"]
@@ -687,7 +925,8 @@ async def main(symbol_arg=None):
             logging.info(f"Found {len(csv_keys)} CSV files for symbol {symbol}.")
             
             # Process all files for this symbol concurrently
-            processing_tasks = [worker(semaphore, key, s3_client, genai_client) for key in csv_keys]
+            # Pass mapping_data to each worker
+            processing_tasks = [worker(semaphore, key, s3_client, genai_client, mapping_data) for key in csv_keys]
             task_results = await asyncio.gather(*processing_tasks)
             
             # Collect results for this symbol
@@ -718,4 +957,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract JSE financial data from S3 CSVs using the Google GenAI API.")
     parser.add_argument("-s", "--symbol", help="Specify a single equity symbol to process.", type=str, default=None)
     args = parser.parse_args()
-    asyncio.run(main(symbol_arg=args.symbol))
+    asyncio.run(main(symbol_arg=args.symbol, mapping_csv_path=STATEMENT_MAPPING_CSV))
