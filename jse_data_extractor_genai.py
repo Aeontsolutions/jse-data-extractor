@@ -909,7 +909,7 @@ async def main(symbol_arg=None, mapping_csv_path=None):
 
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-    symbols_to_process = [s for s in symbols_to_process if s.lower() >= "lab"]
+    symbols_to_process = [s for s in symbols_to_process if s.lower()]
     
     # Process each symbol sequentially but process files within each symbol concurrently
     for symbol in symbols_to_process:
