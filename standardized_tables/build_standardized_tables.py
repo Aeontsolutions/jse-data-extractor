@@ -72,12 +72,12 @@ def run_id() -> str:
 def choose_snapshot(dates: List[str], report_date: datetime.date) -> str:
     if not dates:
         raise ValueError("no snapshot dates")
-    sorted_dates = sorted(dates)
+    sorted_dates = sorted(pd.to_datetime(dates).date)
     if len(sorted_dates) == 1:
-        return sorted_dates[0]
+        return sorted_dates[0].isoformat()
     if len(sorted_dates) == 2:
-        return sorted_dates[1] if report_date >= sorted_dates[1] else sorted_dates[0]
-    return max(d for d in sorted_dates if d <= report_date)
+        return sorted_dates[1].isoformat() if report_date >= sorted_dates[1] else sorted_dates[0].isoformat()
+    return max(d for d in sorted_dates if d <= report_date).isoformat()
 
 def similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
@@ -279,17 +279,27 @@ async def process_company(symbol: str, run: str):
         variant_map: Dict[str, Tuple[str, str]] = {}
         canonical_items: List[str] = []
 
+        def _add_variant(v: str, std: str):
+            """utility: skip nulls and register the normalized key"""
+            if v and isinstance(v, str) and v.strip():
+                variant_map[norm(v)] = (v, std)
+
+        # snapshot-dated variants ---------------------------------------------------
         if snapshot_date:
             for std, variants in dated_snaps[snapshot_date].items():
                 canonical_items.append(std)
                 for v in variants:
-                    variant_map[norm(v)] = (v, std)
+                    _add_variant(v, std)
+                # ensure canonical key itself exists
+                _add_variant(std, std)
 
+        # timeless variants ---------------------------------------------------------
         for std, variants in timeless.items():
             if std not in canonical_items:
                 canonical_items.append(std)
             for v in variants:
-                variant_map.setdefault(norm(v), (v, std))
+                _add_variant(v, std)
+            _add_variant(std, std)
 
         canonical_items = [std for std in canonical_items if std and isinstance(std, str)]
 
