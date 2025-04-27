@@ -3,6 +3,7 @@
 import boto3
 # --- Import google.generativeai ---
 from google import genai
+from google.genai import types
 import sqlite3
 import asyncio
 import os
@@ -26,7 +27,8 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET = "jse-renamed-docs"
 S3_BASE_PREFIX = "CSV/"
-MODEL_NAME = "gemini-2.0-flash"
+# MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-2.5-flash-preview-04-17"
 DB_NAME = "jse_financial_data.db"
 LOG_FILE = "jse_extraction.log"
 STATEMENT_MAPPING_CSV=os.getenv("STATEMENT_MAPPING_CSV_PATH")
@@ -321,16 +323,18 @@ async def determine_group_level_with_llm(genai_client, filename, csv_content, ke
     prompt = build_group_level_prompt(filename, csv_content, keywords_list)
     
     try:
-        config_dict = {
-            "response_mime_type": "application/json",
-            "response_schema": GROUP_LEVEL_SCHEMA_DICT,
-        }
         
         def sync_generate():
             return genai_client.models.generate_content(
                 model=MODEL_NAME,
                 contents=[prompt],
-                config=config_dict
+                config=types.GenerateContentConfig(
+                    response_mime_type='application/json',
+                    response_schema=GROUP_LEVEL_SCHEMA_DICT,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=0
+                    )
+                )
             )
             
         response = await asyncio.to_thread(sync_generate)
@@ -390,8 +394,9 @@ def build_extraction_prompt(filename: str, csv_content: str, previous_output: Op
                 *   Determine the `period_length` covered by that specific value based on its column header. Choose EXACTLY ONE from: ["3mo", "6mo", "9mo", "1y"].
                     *   Hints: "3 months ended..." -> "3mo", "six months ended..." -> "6mo", "nine months ended..." -> "9mo". For annual/audited reports or columns simply labeled with the year/date -> "1y".
             *   Often there are headings that group together a bundle of line items. These headings, for example Current Assets, Current Liabilities, etc will include several line items under them alongside a sum at the end.
+                * * This will most often occur with Assets, Liabilities, Equity, Revenue, which will often have several line items under them. It is **paramount** that you include the headings within your final output
                 * * You should include all of the sub-line-items as well as the heading value (the heading value being the sum) in your extraction.
-                * * Often these "sums" can be easily identified because they are left "dangling", meaning there is no corresponding line item on the same row. You will need to use your intuition to determine this.
+                * * Often these "sums" can be easily identified because they are left "dangling", meaning there is no corresponding line item on the same row. You will need to use your intuition to determine this. Conversely, they can be easily spotted because you'll have a line item without a corresponding value in the same row. The "real" value will be further down, also dangling.
                 * * The headings can correspondingly be easily identified as well because they too will not include a line item value in the same row. In large, this will be a matching exercise.
             *   Cropped line items are often present. These can be in the case of "Net Profits Attributable To:" for example where one or 2 rows proceed, both of which have some value.
                 *   In this case, the correct approach is not to create a line item `Net Profits Attributable To:`, however to join it with each of the proceeding rows.
@@ -403,6 +408,10 @@ def build_extraction_prompt(filename: str, csv_content: str, previous_output: Op
         * Whenever a column just says `Quarter Ended` without specifying a length of time you can assume that it is for a length of `3mo`. These data points should certainly be included.
         * It is __exceedingly__ important that no line items are missed and that you are exhaustive in your coverage.
         * Needless to say, imaginary line items are also unacceptable.
+        * There are certain line items that are very often found in a given CSV
+            * For balance sheets, you will more often than not find 'Assets', 'Liabilities', 'Equity' for instance or some variant of these.
+            * For income statements, you will often find 'Revenue', 'Net Income', 'Operating Income' or some variant of these.
+            * For cash flow statements, you will often find 'Cash Flow from Operations', 'Cash Flow from Investing', 'Cash Flow from Financing' or some variant of these.
     **Example Line Item Logic:**
     If a row 'Revenue' has values in columns '3 Months Ended Sep 2023' and '9 Months Ended Sep 2023', you should generate two entries in the `line_items` list for that row (one for "3mo", one for "9mo").
     
@@ -534,16 +543,18 @@ async def extract_data_with_llm(genai_client: genai.Client, constructed_prompt: 
 
     response = None
     try:
-        config_dict = {
-            "response_mime_type": "application/json",
-            "response_schema": RESPONSE_SCHEMA_DICT, # Use schema provided by user
-        }
         def sync_generate():
             # Use MODEL_NAME provided by user
             return genai_client.models.generate_content(
                 model=MODEL_NAME,
                 contents=[prompt],
-                config=config_dict
+                config=types.GenerateContentConfig(
+                    response_mime_type='application/json',
+                    response_schema=RESPONSE_SCHEMA_DICT,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=0
+                    )
+                )
             )
         response = await asyncio.to_thread(sync_generate)
 
@@ -585,10 +596,15 @@ async def evaluate_extraction(genai_client: genai.Client, filename: str, csv_con
     1. **Review Metadata:** Check if `metadata_predictions` (statement_type, period, group_or_company, trailing_zeros, report_date) correctly follow rules based ONLY on **Filename**. Is `report_date` %Y-%m-%d? Check required fields.
     2. **Check Period Completeness:** Examine CSV columns. Does `line_items` include entries for *all* relevant time periods found? Mark `missing_periods_found` = true if missed.
     3. **Check Grouped Totals:** Look for groupings (Current Assets, Total Liabilities...). Does `line_items` include entries for these *grouping headings/totals* themselves? Mark `missing_grouped_totals_found` = true if missed.
+        - This is a really important check. Some things I would keep a close eye out for are that your Balance Sheets will often have the Asset and Liability figures grouped so you should ensure these are there.
+        - Your income statement *may* have the Revenue grouped
+        - Your cash flow statement *may* have Cash Flow from Operations, Cash Flow from Investing, Cash Flow from Financing grouped
+        - It's **very** important that if these are grouped that they aren't missed in the extraction output.
     4. **Verify Value Handling:** Are `value` fields numbers? Are negatives correct? Are dashes/empty cells 0?
     5. **Check Prior Year Exclusion:** Confirm prior year data is excluded.
     6  **Verify Line Item Coverage Completeness:** Ensure no line items from the original CSV content is missed. This is __very__ important.
     7. **Overall Judgment:** "PASS" only if all rules met accurately. "FAIL" otherwise. Provide brief `evaluation_reasoning`.
+
 
     Structure response per schema. Be concise.
     """
@@ -597,7 +613,18 @@ async def evaluate_extraction(genai_client: genai.Client, filename: str, csv_con
         # Use the user-specified model name here too
         config_dict = { "response_mime_type": "application/json", "response_schema": EVALUATION_SCHEMA_DICT }
         def sync_generate_eval():
-            return genai_client.models.generate_content( model=MODEL_NAME, contents=[evaluator_prompt], config=config_dict )
+            res = genai_client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=[evaluator_prompt],
+                    config=types.GenerateContentConfig(
+                        response_mime_type='application/json',
+                        response_schema=EVALUATION_SCHEMA_DICT,
+                        thinking_config=types.ThinkingConfig(
+                            thinking_budget=1024
+                        )
+                )
+                )
+            return res
         response = await asyncio.to_thread(sync_generate_eval)
         if not hasattr(response, 'text') or not response.text:
              logging.error(f"Eval LLM response missing text for {filename}. Blocked? {getattr(response, 'prompt_feedback', 'N/A')}")
@@ -826,6 +853,7 @@ def save_to_db(records: list, db_path: str):
         for symbol, symbol_records in records_by_symbol.items():
             table_name = f"jse_raw_{symbol}"
             logging.info(f"Saving {len(symbol_records)} records for '{symbol}' to '{table_name}'")
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
             cursor.execute(f"""CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, csv_path TEXT, statement TEXT, report_date DATE, year INTEGER, period TEXT, period_type TEXT, group_or_company_level TEXT, line_item TEXT, line_item_value REAL, period_length TEXT, extraction_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, trailing_zeros TEXT, UNIQUE(csv_path, line_item, period_length))""")
             insert_data = [(r['symbol'], r['csv_path'], r['statement'], r['report_date'], r['year'], r['period'], r['period_type'], r['group_or_company_level'], r['line_item'], r['line_item_value'], r['period_length'], r['trailing_zeros']) for r in symbol_records]
             cursor.executemany(f"""INSERT INTO {table_name} (symbol, csv_path, statement, report_date, year, period, period_type, group_or_company_level, line_item, line_item_value, period_length, trailing_zeros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(csv_path, line_item, period_length) DO UPDATE SET statement=excluded.statement, report_date=excluded.report_date, year=excluded.year, period=excluded.period, period_type=excluded.period_type, group_or_company_level=excluded.group_or_company_level, line_item_value=excluded.line_item_value, extraction_timestamp=CURRENT_TIMESTAMP, trailing_zeros=excluded.trailing_zeros""", insert_data)
