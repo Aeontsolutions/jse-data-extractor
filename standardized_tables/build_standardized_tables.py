@@ -25,6 +25,7 @@ import argparse, asyncio, json, logging, re, sys
 from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Tuple
+import difflib
 
 import pandas as pd
 from google.cloud import bigquery, secretmanager
@@ -78,43 +79,74 @@ def choose_snapshot(dates: List[str], report_date: datetime.date) -> str:
         return sorted_dates[1] if report_date >= sorted_dates[1] else sorted_dates[0]
     return max(d for d in sorted_dates if d <= report_date)
 
+def similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
 # ── LLM SET-UP (exactly like in your notebook) ──────────────────────────────
-LLM_SCHEMA_TEMPLATE  = {
+CANON_SCHEMA_TEMPLATE   = {
     "type": "ARRAY",
     "items": {
         "type": "OBJECT",
         "properties": {
-            "raw":       {"type": "STRING"},
-            "canonical": {
+            "company_line_item": {
                 "type": "STRING",
-                "enum": ["NONE"]
+                "enum": []
+            },
+            "raw_match": {
+                "type": "STRING",
+                "enum": []
             },
         },
-        "required": ["raw", "canonical"],
+        "required": ["company_line_item", "raw_match"],
     },
 }
 
-async def llm_map(canonical_names: List[str], raw_headers: List[str]) -> Dict[str, str]:
+async def map_canonical_to_raw(
+    canonical_items: List[str],
+    raw_headers: List[str],
+) -> Dict[str, str]:
+    """
+    Returns dict {company_line_item -> raw_match | NONE | AMBIG | LLM_ERROR}
+    """
+
     prompt = f"""
-You are a meticulous financial analyst.
+    You are a meticulous financial analyst.
 
-**Task**  
-For each RAW header choose exactly ONE canonical line-item name from the list
-below.  Use "NONE" if no name fits, "AMBIG" if more than one fits.
+    **Goal**
+    For each *company-specific line item* below, pick **exactly one** matching raw
+    header from this statement slice **only if you are >90% certain**.  
 
-Canonical whitelist ({len(canonical_names)}):
-{json.dumps(canonical_names, indent=2)}
+    - If you are uncertain at all, return "NONE".  
+    - If more than one raw header is equally plausible, return "AMBIG".
 
-Raw headers to classify ({len(raw_headers)}):
-{json.dumps(raw_headers, indent=2)}
+    A good rule of thumb is that if the name isn't a very close match, it probably isn't one. I don't want you making guesses.
+    A good match could be mapping "Net Income" to "Net Income (Loss) Attributable to Common Shareholders".
+    A bad match would be mapping "Equity" to "Capital and reserves attributable to equity holders of the parent".
+    There are upstream processes built to ensure that you are getting data that is *close* so if it's not then it's not a match.
 
-Return JSON array: [{{"raw": "...", "canonical": "..."}}, …]
-"""
-    valid_names = [c for c in canonical_names if c]           # drop NULL / None
-    choices = valid_names + ["NONE", "AMBIG"]                 # whitelist
+    Again, if you're not sure, return "NONE".
 
-    schema = deepcopy(LLM_SCHEMA_TEMPLATE)
-    schema["items"]["properties"]["canonical"]["enum"] = choices or ["NONE", "AMBIG"]
+    **Company-specific items** ({len(canonical_items)}):
+    {json.dumps(canonical_items, indent=2)}
+
+    **Raw headers in this slice** ({len(raw_headers)}):
+    {json.dumps(raw_headers, indent=2)}
+
+    Respond with a JSON array.  Each element **must** follow this schema:
+
+    ```json
+    {{
+    "company_line_item": "<one of the canonical items verbatim>",
+    "raw_match": "<one raw header OR 'NONE' OR 'AMBIG'>"
+    }}
+    ```
+    """
+    # build enum
+    schema = deepcopy(CANON_SCHEMA_TEMPLATE)
+    valid_canonical = [c for c in canonical_items if isinstance(c, str) and c.strip()]
+    schema["items"]["properties"]["company_line_item"]["enum"] = valid_canonical
+    valid_raws = [r for r in raw_headers if isinstance(r, str) and r.strip()]
+    schema["items"]["properties"]["raw_match"]["enum"] = valid_raws + ["NONE", "AMBIG"]
 
     cfg = {
         "response_mime_type": "application/json",
@@ -132,10 +164,10 @@ Return JSON array: [{{"raw": "...", "canonical": "..."}}, …]
     resp = await asyncio.to_thread(sync_call)
     try:
         arr = json.loads(resp.text)
-        return {d["raw"]: d["canonical"] for d in arr}
+        return {d["company_line_item"]: d["raw_match"] for d in arr}
     except Exception as e:
         logging.error("LLM JSON parse error: %s", e)
-        return {h: "LLM_ERROR" for h in raw_headers}
+        return {c: "LLM_ERROR" for c in canonical_items}
 
 # ── LOOKUP LOADER ────────────────────────────────────────────────────────────
 def load_lookup(symbol: str):
@@ -236,122 +268,172 @@ async def process_company(symbol: str, run: str):
     # --- NEW: dedup set to avoid duplicate mappings ---
     seen_map_keys: set[tuple] = set()   # (raw_line_item, snapshot_date)
 
-    async def handle_slice(key, data):
-        rd, per, ptyp, gcl = key
-        snap_dates = list(dated_snaps)
-        snapshot_date = choose_snapshot(snap_dates, rd.date()) if snap_dates else None
+    async def handle_slice(slice_key, slice_data):
+        # ── unpack the slice descriptor ──────────────────────────────────────────
+        rd, per, ptyp, gcl = slice_key
+        snapshot_date = (
+            choose_snapshot(list(dated_snaps), rd.date()) if dated_snaps else None
+        )
 
-        # ---- build maps ---------------------------------------------------------
-        variant_map: Dict[str, Tuple[str, str]] = {}   # norm(variant) -> (company_variant, std)
-        canonical_names: List[str] = []
+        # ── build lookup structures (variant → (canonical, std)) ────────────────
+        variant_map: Dict[str, Tuple[str, str]] = {}
+        canonical_items: List[str] = []
 
         if snapshot_date:
-            for std, vars in dated_snaps[snapshot_date].items():
-                canonical_names.append(std)
-                for v in vars:
+            for std, variants in dated_snaps[snapshot_date].items():
+                canonical_items.append(std)
+                for v in variants:
                     variant_map[norm(v)] = (v, std)
-        for std, vars in timeless.items():
-            if std not in canonical_names:
-                canonical_names.append(std)
-            for v in vars:
+
+        for std, variants in timeless.items():
+            if std not in canonical_items:
+                canonical_items.append(std)
+            for v in variants:
                 variant_map.setdefault(norm(v), (v, std))
 
-        # ---- exact vs LLM -------------------------------------------------------
-        exact, to_llm = {}, []
-        for raw in data["headers"]:
-            nk = norm(raw)
-            if nk in variant_map:
-                exact[raw] = variant_map[nk]
-            else:
-                to_llm.append(raw)
+        canonical_items = [std for std in canonical_items if std and isinstance(std, str)]
 
-        # track which company-specific items we ended up mapping
-        mapped_company_items = set()
+        raw_headers = list(slice_data["headers"])
 
-        # exact rows
-        for raw, (comp, std) in exact.items():
-            mapped_company_items.add(comp)
+        # ── exact matches (string-normalized) ───────────────────────────────────
+        mapped_lookup = set()
+        for raw in raw_headers:
+            n = norm(raw)
+            if n in variant_map:
+                company_variant, std = variant_map[n]
+                mapped_lookup.add(company_variant)
 
-            dedup_key = (raw, snapshot_date, rd, per, ptyp, gcl)
-            if dedup_key in seen_map_keys:
-                continue
-            seen_map_keys.add(dedup_key)
-
-            map_rows.append(
-                dict(
-                    run_id=run, symbol=symbol, snapshot_date=snapshot_date,
-                    report_date=rd, period=per, period_type=ptyp,
-                    group_or_company_level=gcl,
-                    raw_line_item=raw,
-                    company_line_item=comp,
-                    standardized_line_item=std,
-                    match_type="EXACT",
-                )
-            )
-
-        # LLM rows
-        if to_llm:
-            async with sem:
-                llm_res = await llm_map(canonical_names, to_llm)
-
-            for raw in to_llm:
-                std = llm_res.get(raw, "LLM_ERROR")
-                if std in canonical_names:
-                    dedup = (raw, snapshot_date)
-                    if dedup in seen_map_keys:
-                        continue
+                dedup = (raw, snapshot_date, rd, per, ptyp, gcl)
+                if dedup not in seen_map_keys:
                     seen_map_keys.add(dedup)
-                    mapped_company_items.add(raw)
-                    dedup_key = (raw, snapshot_date, rd, per, ptyp, gcl)
-                    if dedup_key in seen_map_keys:
-                        continue
-                    seen_map_keys.add(dedup_key)
-
                     map_rows.append(
                         dict(
                             run_id=run, symbol=symbol, snapshot_date=snapshot_date,
                             report_date=rd, period=per, period_type=ptyp,
                             group_or_company_level=gcl,
                             raw_line_item=raw,
-                            company_line_item=raw,
+                            company_line_item=company_variant,
                             standardized_line_item=std,
-                            match_type="LLM",
-                        )
-                    )
-                else:
-                    # LLM failed or ambiguous
-                    audit_rows.append(
-                        dict(
-                            run_id=run, symbol=symbol,
-                            csv_path=next(iter(data["csv"])),
-                            report_date=rd, period=per, period_type=ptyp,
-                            group_or_company_level=gcl,
-                            snapshot_date=snapshot_date,
-                            company_line_item=raw,
-                            standardized_line_item=None,
-                            status=std,               # NONE | AMBIG | LLM_ERROR
-                            llm_detail=raw
+                            match_type="EXACT",
                         )
                     )
 
-        # ---- validation: expected items that never appeared ---------------------
-        expected_comp_items = {v for (_, (v, _)) in variant_map.items()}
-        missing = expected_comp_items - mapped_company_items
-        for comp in missing:
-            std = variant_map[norm(comp)][1]
+        # ── LLM pass: canonical ► raw header (one-to-one) ───────────────────────
+        async with sem:
+            llm_res = await map_canonical_to_raw(canonical_items, raw_headers)
+
+        for canonical in canonical_items:
+            raw_match = llm_res.get(canonical, "LLM_ERROR")
+
+            # ── evaluate similarity ------------------------------------------------
+            sim_score = (
+                similarity(canonical, raw_match)
+                if raw_match not in ("NONE", "AMBIG", "LLM_ERROR")
+                else 0.0
+            )
+            pass_similarity = sim_score >= 0.70 
+
+            if raw_match not in ("NONE", "AMBIG", "LLM_ERROR"):
+                mapped_lookup.add(canonical)
+
+                dedup = (raw_match, snapshot_date, rd, per, ptyp, gcl)
+                if dedup not in seen_map_keys:
+                    seen_map_keys.add(dedup)
+                    map_rows.append(
+                        dict(
+                            run_id=run, symbol=symbol, snapshot_date=snapshot_date,
+                            report_date=rd, period=per, period_type=ptyp,
+                            group_or_company_level=gcl,
+                            raw_line_item=raw_match,
+                            company_line_item=canonical,
+                            standardized_line_item=variant_map[norm(canonical)][1],
+                            match_type="LLM",
+                        )
+                    )
+
+                # Log low-confidence matches
+                if not pass_similarity:
+                    audit_rows.append(
+                        dict(
+                            run_id=run, symbol=symbol,
+                            csv_path=next(iter(slice_data["csv"])),
+                            report_date=rd, period=per, period_type=ptyp,
+                            group_or_company_level=gcl,
+                            snapshot_date=snapshot_date,
+                            company_line_item=canonical,
+                            standardized_line_item=variant_map[norm(canonical)][1],
+                            status="LOW_CONFIDENCE",
+                            llm_detail=f"{raw_match} (sim={sim_score:.2f})",
+                        )
+                    )
+            else:
+                # log LLM ambiguity / failure for a canonical item
+                audit_rows.append(
+                    dict(
+                        run_id=run, symbol=symbol,
+                        csv_path=next(iter(slice_data["csv"])),
+                        report_date=rd, period=per, period_type=ptyp,
+                        group_or_company_level=gcl,
+                        snapshot_date=snapshot_date,
+                        company_line_item=canonical,
+                        standardized_line_item=variant_map[norm(canonical)][1],
+                        status=raw_match,           # NONE | AMBIG | LLM_ERROR
+                        llm_detail=None,
+                    )
+                )
+
+        # ── raw headers that never matched any lookup item ─────────────────────────
+        raw_headers = list(slice_data["headers"])
+
+        exact_matched = {
+            raw for raw in raw_headers
+            if norm(raw) in variant_map
+        }
+        mapped_raws = {
+            rm for rm in llm_res.values()
+            if rm not in ("NONE", "AMBIG", "LLM_ERROR")
+        }
+
+        # 3) everything else is noise
+        unmapped_noise = set(raw_headers) - exact_matched - mapped_raws
+
+        for raw in unmapped_noise:
+            audit_rows.append(
+                dict(
+                    run_id=run,
+                    symbol=symbol,
+                    csv_path=next(iter(slice_data["csv"])),
+                    report_date=rd,
+                    period=per,
+                    period_type=ptyp,
+                    group_or_company_level=gcl,
+                    snapshot_date=snapshot_date,
+                    company_line_item=None,
+                    standardized_line_item=None,
+                    status="RAW_UNMAPPED",
+                    llm_detail=raw,
+                )
+            )
+
+
+        # ── lookup items still missing after LLM pass ───────────────────────────
+        expected = {v for (_, (v, _)) in variant_map.items()}
+        for missing in expected - mapped_lookup:
+            std = variant_map[norm(missing)][1]
             audit_rows.append(
                 dict(
                     run_id=run, symbol=symbol,
-                    csv_path=next(iter(data["csv"])),
+                    csv_path=next(iter(slice_data["csv"])),
                     report_date=rd, period=per, period_type=ptyp,
                     group_or_company_level=gcl,
                     snapshot_date=snapshot_date,
-                    company_line_item=comp,
+                    company_line_item=missing,
                     standardized_line_item=std,
                     status="EXPECTED_MISSING",
-                    llm_detail=None
+                    llm_detail=None,
                 )
             )
+
 
 
     # run every slice concurrently
