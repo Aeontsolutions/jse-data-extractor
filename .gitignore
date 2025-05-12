@@ -5,3 +5,4 @@ csv_export/*
 *.txt
 *.csv
 venv/
+env/
