@@ -3,7 +3,10 @@
 
 # Set your project ID
 PROJECT_ID="jse-datasphere"
-DATASET_ID="jse_raw_financial_data"
+DATASET_ID="jse_raw_financial_data_dev_elroy"
+
+echo "Creating dataset in BigQuery..."
+bq mk --location=US ${PROJECT_ID}:${DATASET_ID}
 
 echo "Creating tables in BigQuery..."
 

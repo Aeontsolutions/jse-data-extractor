@@ -1,37 +1,52 @@
-# COMPLETE SCRIPT incorporating evaluation/retry logic into the user-provided code
+"""
+JSE Data Extractor using Google GenAI
 
-import boto3
-# --- Import google.generativeai ---
-from google import genai
-from google.genai import types
-import sqlite3
+This module extracts financial data from JSE (Jamaica Stock Exchange) CSV files using Google's Generative AI.
+It processes financial statements, extracts structured data, and stores it in a SQLite database.
+
+Key Features:
+- Asynchronous processing of multiple files
+- AI-powered data extraction and validation
+- Support for different statement types (Balance Sheet, Income Statement, etc.)
+- Group/Company level determination
+- Concurrent processing with rate limiting
+"""
+
+# Standard library imports
 import asyncio
-import os
-import logging
-import re
-from datetime import datetime
-import json
-from dotenv import load_dotenv
 import argparse
 import io
-# NOTE: Pandas is not used for CSV prep in the provided user code below
-# import pandas as pd 
-from typing import List, Union, Literal, Optional, Dict, Any # Added Optional, Dict, Any
+import json
+import logging
+import os
+import re
+import sqlite3
+from datetime import datetime
+from typing import List, Union, Literal, Optional, Dict, Any
 
-# --- Configuration ---
+# Third-party imports
+import boto3
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+# --- Configuration and Constants ---
+# Load environment variables
 load_dotenv()
 
+# API and AWS Configuration
 API_KEY_NAME = "GOOGLE_VERTEX_API_KEY"
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET = "jse-renamed-docs"
 S3_BASE_PREFIX = "CSV/"
-# MODEL_NAME = "gemini-2.0-flash"
+
+# Model and Database Configuration
 MODEL_NAME = "gemini-2.5-flash-preview-04-17"
 DB_NAME = "jse_financial_data.db"
 LOG_FILE = "jse_extraction.log"
-STATEMENT_MAPPING_CSV=os.getenv("STATEMENT_MAPPING_CSV_PATH")
+STATEMENT_MAPPING_CSV = os.getenv("STATEMENT_MAPPING_CSV_PATH")
 CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT"))
 
 logging.basicConfig(
@@ -43,6 +58,8 @@ logging.basicConfig(
     ]
 )
 
+# --- Schema Definitions ---
+# Response schema for data extraction
 RESPONSE_SCHEMA_DICT = {
     "type": "OBJECT",
     "properties": {
@@ -72,7 +89,7 @@ RESPONSE_SCHEMA_DICT = {
                 },
                 "report_date": {
                     "type": "STRING",
-                    "description": "Taken from the filename but conformed to the format %Y-%m-%d eg. 2024-11-30" # Corrected format specifier
+                    "description": "Taken from the filename but conformed to the format %Y-%m-%d eg. 2024-11-30"
                 }
             },
             "required": ["statement_type", "period", "group_or_company", "report_date", "trailing_zeros"]
@@ -104,8 +121,7 @@ RESPONSE_SCHEMA_DICT = {
     "required": ["metadata_predictions", "line_items"]
 }
 
-
-# --- NEW: Schema for Evaluator ---
+# Evaluation schema for extraction validation
 EVALUATION_SCHEMA_DICT = {
     "type": "OBJECT",
     "properties": {
@@ -116,7 +132,7 @@ EVALUATION_SCHEMA_DICT = {
         },
         "evaluation_reasoning": {
             "type": "STRING",
-            "description": "Brief explanation for the judgment. If FAIL, specify the primary rule(s) violated (e.g., 'Missing 9mo period data', 'Missing Current Assets total', 'Incorrect metadata'). If PASS, state 'Compliant'."
+            "description": "Brief explanation for the judgment. If FAIL, specify the primary rule(s) violated."
         },
         "missing_periods_found": {
             "type": "BOOLEAN",
@@ -124,13 +140,13 @@ EVALUATION_SCHEMA_DICT = {
         },
         "missing_grouped_totals_found": {
             "type": "BOOLEAN",
-            "description": "True if the evaluation identified expected grouped totals/headings (like 'Current Assets') missing from the line item output."
+            "description": "True if the evaluation identified expected grouped totals/headings missing from the line item output."
         }
     },
     "required": ["evaluation_judgment", "evaluation_reasoning", "missing_periods_found", "missing_grouped_totals_found"]
 }
 
-# --- NEW: Schema for Group Level Determination ---
+# Group level determination schema
 GROUP_LEVEL_SCHEMA_DICT = {
     "type": "OBJECT",
     "properties": {
@@ -152,41 +168,122 @@ GROUP_LEVEL_SCHEMA_DICT = {
     "required": ["group_level_determination", "confidence", "reasoning"]
 }
 
-# --- Helper Functions (parse_date_from_filename, clean_value) ---
-def parse_date_from_filename(filename):
+# --- Utility Functions ---
+def parse_date_from_filename(filename: str) -> Optional[datetime.date]:
     """
-    Parses YYYY-MM-DD date from the end of the filename string.
-    Expects the format -[MonthName]-[DD]-[YYYY].csv at the very end.
+    Parse YYYY-MM-DD date from the end of the filename string.
+    
+    Args:
+        filename: The filename to parse
+        
+    Returns:
+        datetime.date object if successful, None otherwise
     """
     match = re.search(r'-([a-zA-Z]+)-(\d{1,2})-(\d{4})\.csv$', filename, re.IGNORECASE)
     if match:
         month_str, day_str, year_str = match.groups()
         try:
-            day = int(day_str); year = int(year_str)
-            month_map = {'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12}
+            day = int(day_str)
+            year = int(year_str)
+            month_map = {
+                'january': 1, 'february': 2, 'march': 3, 'april': 4,
+                'may': 5, 'june': 6, 'july': 7, 'august': 8,
+                'september': 9, 'october': 10, 'november': 11, 'december': 12
+            }
             month = month_map.get(month_str.lower())
-            if month: return datetime(year, month, day).date()
-            else: logging.warning(f"Month parse fail '{month_str}' in {filename}"); return None
-        except ValueError as e: logging.warning(f"Date component error {year_str}-{month_str}-{day_str} in {filename}: {e}"); return None
-    else: logging.warning(f"Date pattern '-Month-DD-YYYY.csv' not found at end of {filename}"); return None
+            if month:
+                return datetime(year, month, day).date()
+            else:
+                logging.warning(f"Month parse fail '{month_str}' in {filename}")
+                return None
+        except ValueError as e:
+            logging.warning(f"Date component error {year_str}-{month_str}-{day_str} in {filename}: {e}")
+            return None
+    else:
+        logging.warning(f"Date pattern '-Month-DD-YYYY.csv' not found at end of {filename}")
+        return None
 
-def clean_value(value_raw: Union[str, int, float, None]) -> Union[float, None]:
-    """Cleans financial string/numeric value and converts to float."""
-    if value_raw is None: return None
-    if isinstance(value_raw, (int, float)): return float(value_raw)
-    if not isinstance(value_raw, str): return None # User version didn't log warning here
+def clean_value(value_raw: Union[str, int, float, None]) -> Optional[float]:
+    """
+    Clean financial string/numeric value and convert to float.
+    
+    Args:
+        value_raw: The raw value to clean
+        
+    Returns:
+        float value if successful, None otherwise
+    """
+    if value_raw is None:
+        return None
+    if isinstance(value_raw, (int, float)):
+        return float(value_raw)
+    if not isinstance(value_raw, str):
+        return None
+        
     value_str = re.sub(r'\[[a-zA-Z0-9]+\]$', '', value_raw.strip())
     cleaned = value_str.replace(',', '').replace('$', '').replace(' ', '')
     is_negative = False
-    if cleaned.startswith('(') and cleaned.endswith(')'): is_negative = True; cleaned = cleaned[1:-1]
-    if cleaned.startswith('-'): is_negative = True
+    
+    if cleaned.startswith('(') and cleaned.endswith(')'):
+        is_negative = True
+        cleaned = cleaned[1:-1]
+    if cleaned.startswith('-'):
+        is_negative = True
+        
     try:
-        if not cleaned: return None # User version returned None for empty string
+        if not cleaned:
+            return None
         value_float = float(cleaned)
-        if is_negative and value_float > 0: value_float *= -1
-        elif is_negative and value_float == 0: value_float = 0.0
+        if is_negative and value_float > 0:
+            value_float *= -1
+        elif is_negative and value_float == 0:
+            value_float = 0.0
         return value_float
-    except ValueError: return None # User version returned None on error
+    except ValueError:
+        return None
+
+def load_statement_mapping(csv_content_str: str) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Load and process financial statement mapping data.
+    
+    Args:
+        csv_content_str: The CSV content as a string
+        
+    Returns:
+        Dictionary mapping symbols to their statement configurations
+    """
+    mapping_data = {}
+    
+    try:
+        csv_io = io.StringIO(csv_content_str)
+        import csv
+        reader = csv.DictReader(csv_io)
+        
+        for row in reader:
+            symbol = row.get('Symbol')
+            if not symbol:
+                continue
+                
+            if symbol not in mapping_data:
+                mapping_data[symbol] = []
+                
+            keywords = row.get('Associated Title Key Words', '')
+            
+            mapping_data[symbol].append({
+                'company': row.get('Company', ''),
+                'report_type': row.get('Report Type', ''),
+                'statement_type': row.get('Statement Type', ''),
+                'keywords': keywords,
+                'annual_period_start': row.get('Annual Period Start', ''),
+                'annual_period_end': row.get('Annual Period End', ''),
+                'note': row.get('Note', '')
+            })
+            
+        return mapping_data
+        
+    except Exception as e:
+        logging.error(f"Error processing statement mapping CSV: {e}")
+        return {}
 
 # --- list_csv_files async function  ---
 async def list_csv_files(s3_client, bucket, prefix):
@@ -205,81 +302,48 @@ async def list_csv_files(s3_client, bucket, prefix):
     logging.info(f"Found {len(keys)} CSV files in {prefix}.")
     return keys
 
-# --- NEW: Function to load and process statement mapping CSV ---
-def load_statement_mapping(csv_content_str):
-    """Load and process financial statement mapping data."""
-    mapping_data = {}
-    
-    try:
-        # Use StringIO to treat the string as a file-like object
-        csv_io = io.StringIO(csv_content_str)
-        
-        # Parse the CSV using csv module
-        import csv
-        reader = csv.DictReader(csv_io)
-        
-        # Group by symbol
-        for row in reader:
-            symbol = row.get('Symbol')
-            if not symbol:
-                continue
-                
-            if symbol not in mapping_data:
-                mapping_data[symbol] = []
-                
-            # Add entry to the list for this symbol
-            # Note: The 'Associated Title Key Words' column might literally contain the string "None"
-            keywords = row.get('Associated Title Key Words', '')
-            
-            mapping_data[symbol].append({
-                'company': row.get('Company', ''),
-                'report_type': row.get('Report Type', ''),
-                'statement_type': row.get('Statement Type', ''),
-                'keywords': keywords,  # Store the actual string value, including "None" if present
-                'annual_period_start': row.get('Annual Period Start', ''),
-                'annual_period_end': row.get('Annual Period End', ''),
-                'note': row.get('Note', '')
-            })
-            
-        return mapping_data
-        
-    except Exception as e:
-        logging.error(f"Error processing statement mapping CSV: {e}")
-        return {}
-
-# --- NEW: Function to determine if LLM is needed for group level determination ---
-def needs_llm_determination(symbol, mapping_data):
+# --- LLM Processing Functions ---
+def needs_llm_determination(symbol: str, mapping_data: Dict) -> tuple[bool, List[str]]:
     """
     Determine if a symbol needs LLM for group vs company determination.
-    Returns (needs_llm, keywords_list) tuple.
+    
+    Args:
+        symbol: The stock symbol
+        mapping_data: The mapping data dictionary
+        
+    Returns:
+        Tuple of (needs_llm, keywords_list)
     """
     if symbol not in mapping_data:
-        # No mapping data for this symbol, default to using original determination
         return False, []
         
     entries = mapping_data[symbol]
     keywords_set = {entry['keywords'] for entry in entries}
     
-    # If all keywords are the literal string "None", use deterministic company level
     if keywords_set == {'None'} or (len(keywords_set) == 1 and "None" in keywords_set):
         return False, []
         
-    # Otherwise, we need LLM determination with available keywords
-    # Exclude the literal "None" string entries
     keywords_list = [kw for kw in keywords_set if kw != "None" and kw]
     return True, keywords_list
 
-# --- NEW: Function to build group level determination prompt ---
-def build_group_level_prompt(filename, csv_content, keywords_list):
-    """Build prompt for determining group vs company level using LLM."""
+def build_group_level_prompt(filename: str, csv_content: str, keywords_list: List[str]) -> str:
+    """
+    Build prompt for determining group vs company level using LLM.
     
-    prompt = f"""
+    Args:
+        filename: The filename to analyze
+        csv_content: The CSV content to analyze
+        keywords_list: List of keywords associated with group statements
+        
+    Returns:
+        Formatted prompt string
+    """
+    return f"""
     You are a financial data analyst specializing in determining whether financial statements are at the GROUP (consolidated) level or COMPANY level.
     Additional context: All the listings you are being presented with are for conglomerates so don't be surprised if "group" is present within the filenames.
     Additional context cont'd: Your job is in distinguishing with of the statements for this GROUP is at the company or group/consolidated level
     Additional context cont'd: This requires you to use your smarts - if the company name has group in it but the statement file has "company statement" in there then it's clearly a Company Statement
 
-    
     **Filename:** `{filename}`
     
     **CSV Content (sample):**
@@ -313,17 +377,28 @@ def build_group_level_prompt(filename, csv_content, keywords_list):
     
     Return your analysis in the specified JSON format.
     """
-    
-    return prompt
 
-# --- NEW: Function to determine group level using LLM ---
-async def determine_group_level_with_llm(genai_client, filename, csv_content, keywords_list):
-    """Uses Gemini LLM to determine if a statement is at group or company level."""
+async def determine_group_level_with_llm(
+    genai_client: genai.Client,
+    filename: str,
+    csv_content: str,
+    keywords_list: List[str]
+) -> str:
+    """
+    Uses Gemini LLM to determine if a statement is at group or company level.
     
+    Args:
+        genai_client: The Google GenAI client
+        filename: The filename to analyze
+        csv_content: The CSV content to analyze
+        keywords_list: List of keywords associated with group statements
+        
+    Returns:
+        "group" or "company" string
+    """
     prompt = build_group_level_prompt(filename, csv_content, keywords_list)
     
     try:
-        
         def sync_generate():
             return genai_client.models.generate_content(
                 model=MODEL_NAME,
@@ -351,7 +426,6 @@ async def determine_group_level_with_llm(genai_client, filename, csv_content, ke
         reasoning = data.get("reasoning", "No reasoning provided")
         
         logging.info(f"Group level determined for {filename}: {group_level} (confidence: {confidence})\nReasoning: {reasoning}")
-        # logging.debug(f"Group level reasoning: {reasoning}")
         
         return group_level
         
@@ -641,19 +715,52 @@ async def evaluate_extraction(genai_client: genai.Client, filename: str, csv_con
         except Exception: pass
         return None
 
-# --- CSV Processing Function (Integrates Evaluation Loop & Prompt Modification - Minimal changes here) ---
-async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mapping_data=None):
-    """Processes a single CSV file: download, extract, evaluate, structure."""
+# --- Core Processing Functions ---
+async def worker(semaphore: asyncio.Semaphore, key: str, s3_client, genai_client: genai.Client, mapping_data: Optional[Dict] = None) -> Optional[List[Dict]]:
+    """
+    Worker wrapper to acquire semaphore before processing.
+    
+    Args:
+        semaphore: The semaphore for rate limiting
+        key: The S3 key to process
+        s3_client: The S3 client
+        genai_client: The Google GenAI client
+        mapping_data: Optional mapping data for group/company determination
+        
+    Returns:
+        List of processed records or None if processing failed
+    """
+    async with semaphore:
+        return await process_csv(key, s3_client, genai_client, mapping_data)
+
+async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mapping_data: Optional[Dict] = None) -> Optional[List[Dict]]:
+    """
+    Process a single CSV file: download, extract, evaluate, structure.
+    
+    Args:
+        s3_key: The S3 key of the CSV file
+        s3_client: The S3 client
+        genai_client: The Google GenAI client
+        mapping_data: Optional mapping data for group/company determination
+        
+    Returns:
+        List of processed records or None if processing failed
+    """
     filename = os.path.basename(s3_key)
     logging.info(f"Processing: {s3_key}")
-    simplified_csv_content = None # Define outside try block
+    simplified_csv_content = None
 
     # 1. Parse Symbol/PeriodType
     try:
-        parts = s3_key.split('/'); symbol = parts[1] if len(parts) > 2 and parts[0].upper() == 'CSV' else None
-        if not symbol: logging.error(f"No symbol from path: {s3_key}"); return None
+        parts = s3_key.split('/')
+        symbol = parts[1] if len(parts) > 2 and parts[0].upper() == 'CSV' else None
+        if not symbol:
+            logging.error(f"No symbol from path: {s3_key}")
+            return None
         period_type = 'quarterly' if 'unaudited_financial_statements' in s3_key else 'annual'
-    except Exception as e: logging.error(f"Initial metadata parse error {s3_key}: {e}"); return None
+    except Exception as e:
+        logging.error(f"Initial metadata parse error {s3_key}: {e}")
+        return None
 
     # 2. Download and Prepare CSV Content
     try:
@@ -666,24 +773,25 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mappin
             try:
                 csv_content_str = csv_content_bytes.decode('latin-1')
                 simplified_csv_content = csv_content_str
-            except Exception as decode_err: logging.error(f"Decode CSV failed {s3_key}: {decode_err}"); return None
-    except Exception as e: logging.error(f"S3 download error {s3_key}: {e}"); return None
+            except Exception as decode_err:
+                logging.error(f"Decode CSV failed {s3_key}: {decode_err}")
+                return None
+    except Exception as e:
+        logging.error(f"S3 download error {s3_key}: {e}")
+        return None
 
-    # --- Added: Extraction and Evaluation Loop ---
-    max_attempts = 2 # Set max attempts (1 initial + 1 retry)
+    # 3. Extraction and Evaluation Loop
+    max_attempts = 2
     attempt_count = 0
     evaluation_passed = False
-    last_llm_result = None # Holds the result of the latest successful extraction
-    last_evaluation_result = None # Holds the feedback from the latest evaluation
-
-    # Define rules string once for the evaluator (copied from build_extraction_prompt)
-    rules_for_evaluator = """... (Copy the multi-line rules string from build_extraction_prompt's base_prompt_instructions exactly as it is there) ...""" # You need to paste the exact rules here
+    last_llm_result = None
+    last_evaluation_result = None
 
     while attempt_count < max_attempts and not evaluation_passed:
         current_attempt_num = attempt_count + 1
         logging.info(f"Extraction Attempt {current_attempt_num}/{max_attempts} for {filename}")
 
-        # 3a. Build Prompt for this attempt
+        # Build prompt for this attempt
         current_prompt = build_extraction_prompt(
             filename,
             simplified_csv_content,
@@ -691,54 +799,50 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mappin
             evaluation_feedback=last_evaluation_result if attempt_count > 0 else None
         )
 
-        # 3b. Extract Data using LLM (Using the user's original function structure)
-        # NOTE: Passing the constructed prompt to the original function signature
-        # This requires the original extract_data_with_llm to be modified to accept the prompt
-        # Reverting to call the original function signature for now as per constraint,
-        # but this means prompt modification won't take effect without changing extract_data_with_llm
-        # --- MAKING THE CHANGE TO PASS PROMPT ---
-        current_llm_result = await extract_data_with_llm( # This function now needs modification
-             genai_client,
-             current_prompt, # Pass the prompt built above
-             filename # Keep passing filename for logging inside
+        # Extract data using LLM
+        current_llm_result = await extract_data_with_llm(
+            genai_client,
+            current_prompt,
+            filename
         )
-        # --- END OF CHANGE ---
 
         if not current_llm_result:
             logging.error(f"Extractor failed on attempt {current_attempt_num} for {filename}. Stopping attempts for this file.")
             last_llm_result = None
-            break # Exit loop
+            break
 
-        # Store this attempt's successful result
         last_llm_result = current_llm_result
 
-        # 3c. Evaluate the Extraction Result
+        # Evaluate the extraction result
         logging.info(f"Evaluating extraction attempt {current_attempt_num} for {filename}")
         current_evaluation_result = await evaluate_extraction(
-            genai_client, filename, simplified_csv_content, rules_for_evaluator, last_llm_result
+            genai_client,
+            filename,
+            simplified_csv_content,
+            rules_for_evaluator,
+            last_llm_result
         )
 
-        attempt_count += 1 # Increment attempt counter *after* evaluation attempt
+        attempt_count += 1
 
         if current_evaluation_result:
             last_evaluation_result = current_evaluation_result
             judgment = current_evaluation_result.get("evaluation_judgment")
             reasoning = current_evaluation_result.get("evaluation_reasoning", "N/A")
             logging.info(f"Evaluation Result (Attempt {attempt_count}): {judgment} - {reasoning}")
+            
             if judgment == "PASS":
                 evaluation_passed = True
-            else: # FAIL
-                 if current_evaluation_result.get("missing_periods_found"): logging.warning(f"Eval FAIL {filename}: Missing periods detected.")
-                 if current_evaluation_result.get("missing_grouped_totals_found"): logging.warning(f"Eval FAIL {filename}: Missing grouped totals detected.")
-                 # Retry will happen if attempt_count < max_attempts
+            else:
+                if current_evaluation_result.get("missing_periods_found"):
+                    logging.warning(f"Eval FAIL {filename}: Missing periods detected.")
+                if current_evaluation_result.get("missing_grouped_totals_found"):
+                    logging.warning(f"Eval FAIL {filename}: Missing grouped totals detected.")
         else:
             logging.error(f"Evaluation LLM call failed for {filename} on attempt {attempt_count}. Cannot verify.")
-            last_evaluation_result = None # Reset feedback
-            # Continue loop if attempts remain, will retry extraction without specific feedback
+            last_evaluation_result = None
 
-    # --- End of Extraction/Evaluation Loop ---
-
-    # Check if we have a result (even if it failed evaluation on the last try)
+    # Check if we have a result
     if not last_llm_result:
         logging.error(f"No successful extraction result after {attempt_count} attempts for {filename}.")
         return None
@@ -746,141 +850,200 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mappin
     if not evaluation_passed:
         logging.warning(f"Proceeding with final extraction data for {filename} after {attempt_count} attempts (Evaluation did not PASS or failed).")
 
-    # --- 4. Structure Data for DB (Using final result, logic as provided by user) ---
+    # 4. Structure Data for DB
     records_for_db = []
-    metadata = last_llm_result.get("metadata_predictions", {}) # Use final result
-    line_items = last_llm_result.get("line_items", [])      # Use final result
+    metadata = last_llm_result.get("metadata_predictions", {})
+    line_items = last_llm_result.get("line_items", [])
 
     statement = metadata.get("statement_type")
     period = metadata.get("period")
-    
-    # Original group_or_company from LLM extraction
     original_group_or_company = metadata.get("group_or_company")
-    
-    trailing_zeros = metadata.get("trailing_zeros") # Flag 'Y'/'N'
-    report_date = metadata.get("report_date") # LLM extracted date
-    
-    # --- NEW: Determine group or company level using mapping data ---
-    # Default to the original determination
+    trailing_zeros = metadata.get("trailing_zeros")
+    report_date = metadata.get("report_date")
+
+    # Determine group or company level
     group_or_company = original_group_or_company
-    
+
     if mapping_data and symbol in mapping_data:
-        # Check if we need LLM determination for this symbol
         needs_llm, keywords_list = needs_llm_determination(symbol, mapping_data)
         
         if not needs_llm:
-            # Deterministic case: If all keywords are the literal string "None", set to company level
             group_or_company = "company"
             logging.info(f"Deterministic group level for {symbol}: company (all keywords are literal 'None')")
         elif keywords_list:
-            # Use LLM to determine group level only if we have meaningful keywords
             logging.info(f"Using LLM to determine group level for {filename} with keywords: {keywords_list}")
             group_or_company = await determine_group_level_with_llm(
-                genai_client, 
-                filename, 
-                simplified_csv_content, 
+                genai_client,
+                filename,
+                simplified_csv_content,
                 keywords_list
             )
         else:
-            # No meaningful keywords but not all "None" - use original determination
             logging.info(f"No meaningful keywords for {symbol}, using original determination: {original_group_or_company}")
     else:
         logging.info(f"No mapping data for {symbol}, using original determination: {original_group_or_company}")
-    
-    # Log if determination changed
+
     if group_or_company != original_group_or_company:
         logging.info(f"Group level changed for {filename}: {original_group_or_company} -> {group_or_company}")
-    
+
     try:
-        # Derive year from LLM date
         report_year = datetime.strptime(report_date, "%Y-%m-%d").strftime("%Y") if report_date else None
-    except (ValueError, TypeError) as e: # Added TypeError
+    except (ValueError, TypeError) as e:
         report_year = None
         logging.warning(f"Incorrect date format extracted '{report_date}' from {filename}: {e}")
 
-    # --- Using required fields check as provided by user ---
     if not all([statement, period, group_or_company]):
-         logging.warning(f"Incomplete metadata {filename}: {metadata}")
-
-    print("==============") # User's debug print
-    print(filename, statement, line_items) # User's debug print
-    print("==============") # User's debug print
+        logging.warning(f"Incomplete metadata {filename}: {metadata}")
 
     for item in line_items:
-        li_name = item.get("line_item"); li_value_raw = item.get("value"); li_period_length = item.get("period_length")
+        li_name = item.get("line_item")
+        li_value_raw = item.get("value")
+        li_period_length = item.get("period_length")
+        
         if not li_name or li_value_raw is None or not li_period_length:
-            logging.warning(f"Incomplete line item {filename}: {item}"); continue
+            logging.warning(f"Incomplete line item {filename}: {item}")
+            continue
 
-        # --- Using value processing logic as provided by user ---
         try:
-            li_value_float = float(li_value_raw) # Directly try float as schema is NUMBER
-            # Apply trailing zeros based on the flag from metadata
-            # Note: User code compared trailing_zeros directly, assuming 'Y' or 'N' string
-            # li_value_float = li_value_float * 1000 if trailing_zeros == "Y" else li_value_float
-        except (ValueError, TypeError) as e: # Added TypeError
+            li_value_float = float(li_value_raw)
+        except (ValueError, TypeError) as e:
             logging.debug(f"Value conversion to float failed '{li_name}'='{li_value_raw}' in {filename}: {e}.")
-            # Attempt cleanup ONLY if conversion fails (fallback)
             li_value_cleaned = clean_value(str(li_value_raw))
             if li_value_cleaned is not None:
-                # li_value_float = li_value_cleaned * 1000 if trailing_zeros == "Y" else li_value_cleaned
                 logging.debug(f"Fallback clean_value succeeded for '{li_name}'='{li_value_raw}'.")
             else:
-                li_value_float = None # Set to None if both direct float and clean_value fail
+                li_value_float = None
 
         records_for_db.append({
-            "symbol": symbol, "csv_path": s3_key, "statement": statement,
-            "report_date": report_date, "year": report_year, "period": period,
-            "period_type": period_type, "group_or_company_level": group_or_company, # Updated with new determination
+            "symbol": symbol,
+            "csv_path": s3_key,
+            "statement": statement,
+            "report_date": report_date,
+            "year": report_year,
+            "period": period,
+            "period_type": period_type,
+            "group_or_company_level": group_or_company,
             "line_item": str(li_name).strip(),
-            "line_item_value": li_value_float, # Use the processed float value
+            "line_item_value": li_value_float,
             "period_length": li_period_length,
             "trailing_zeros": trailing_zeros
         })
 
-    logging.info(f"Structured {len(records_for_db)} records for {filename} from final attempt.") # Updated log message slightly
+    logging.info(f"Structured {len(records_for_db)} records for {filename} from final attempt.")
     return records_for_db
 
 
-# --- Database Saving (save_to_db ) ---
-def save_to_db(records: list, db_path: str):
-    if not records: logging.info("No records to save."); return
+# --- Database Functions ---
+def save_to_db(records: List[Dict], db_path: str) -> None:
+    """
+    Save extracted records to SQLite database.
+    
+    Args:
+        records: List of records to save
+        db_path: Path to the SQLite database file
+    """
+    if not records:
+        logging.info("No records to save.")
+        return
+        
     records_by_symbol = {}
-    for r in records: records_by_symbol.setdefault(r['symbol'], []).append(r)
+    for r in records:
+        records_by_symbol.setdefault(r['symbol'], []).append(r)
+        
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+        
         for symbol, symbol_records in records_by_symbol.items():
             table_name = f"jse_raw_{symbol}"
             logging.info(f"Saving {len(symbol_records)} records for '{symbol}' to '{table_name}'")
+            
+            # Create table if not exists
             cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-            cursor.execute(f"""CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, csv_path TEXT, statement TEXT, report_date DATE, year INTEGER, period TEXT, period_type TEXT, group_or_company_level TEXT, line_item TEXT, line_item_value REAL, period_length TEXT, extraction_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, trailing_zeros TEXT, UNIQUE(csv_path, line_item, period_length))""")
-            insert_data = [(r['symbol'], r['csv_path'], r['statement'], r['report_date'], r['year'], r['period'], r['period_type'], r['group_or_company_level'], r['line_item'], r['line_item_value'], r['period_length'], r['trailing_zeros']) for r in symbol_records]
-            cursor.executemany(f"""INSERT INTO {table_name} (symbol, csv_path, statement, report_date, year, period, period_type, group_or_company_level, line_item, line_item_value, period_length, trailing_zeros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(csv_path, line_item, period_length) DO UPDATE SET statement=excluded.statement, report_date=excluded.report_date, year=excluded.year, period=excluded.period, period_type=excluded.period_type, group_or_company_level=excluded.group_or_company_level, line_item_value=excluded.line_item_value, extraction_timestamp=CURRENT_TIMESTAMP, trailing_zeros=excluded.trailing_zeros""", insert_data)
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    csv_path TEXT,
+                    statement TEXT,
+                    report_date DATE,
+                    year INTEGER,
+                    period TEXT,
+                    period_type TEXT,
+                    group_or_company_level TEXT,
+                    line_item TEXT,
+                    line_item_value REAL,
+                    period_length TEXT,
+                    extraction_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    trailing_zeros TEXT,
+                    UNIQUE(csv_path, line_item, period_length)
+                )
+            """)
+            
+            # Prepare and execute insert
+            insert_data = [(
+                r['symbol'], r['csv_path'], r['statement'], r['report_date'],
+                r['year'], r['period'], r['period_type'], r['group_or_company_level'],
+                r['line_item'], r['line_item_value'], r['period_length'], r['trailing_zeros']
+            ) for r in symbol_records]
+            
+            cursor.executemany(f"""
+                INSERT INTO {table_name} (
+                    symbol, csv_path, statement, report_date, year, period,
+                    period_type, group_or_company_level, line_item, line_item_value,
+                    period_length, trailing_zeros
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(csv_path, line_item, period_length) DO UPDATE SET
+                    statement=excluded.statement,
+                    report_date=excluded.report_date,
+                    year=excluded.year,
+                    period=excluded.period,
+                    period_type=excluded.period_type,
+                    group_or_company_level=excluded.group_or_company_level,
+                    line_item_value=excluded.line_item_value,
+                    extraction_timestamp=CURRENT_TIMESTAMP,
+                    trailing_zeros=excluded.trailing_zeros
+            """, insert_data)
+            
         conn.commit()
         logging.info(f"Saved data for {len(records_by_symbol)} symbols.")
-    except sqlite3.Error as e: logging.error(f"DB error: {e}"); conn and conn.rollback()
-    finally: conn and conn.close()
+        
+    except sqlite3.Error as e:
+        logging.error(f"DB error: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
 
-# --- Worker Function  ---
-async def worker(semaphore, key, s3_client, genai_client: genai.Client, mapping_data=None):
-    """Worker wrapper to acquire semaphore before processing."""
-    async with semaphore:
-        return await process_csv(key, s3_client, genai_client, mapping_data)
-
-
-# --- Main Orchestration  ---
-async def main(symbol_arg=None, mapping_csv_path=None):
+# --- Main Orchestration ---
+async def main(symbol_arg: Optional[str] = None, mapping_csv_path: Optional[str] = None) -> None:
+    """
+    Main orchestration function for the JSE data extraction process.
+    
+    Args:
+        symbol_arg: Optional single equity symbol to process
+        mapping_csv_path: Optional path to the statement mapping CSV file
+    """
     logging.info("Starting JSE Data Extraction Process with GenAI Client...")
-    session = boto3.Session(aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY, region_name=AWS_REGION)
+    
+    # Initialize AWS session and client
+    session = boto3.Session(
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION
+    )
     s3_client = session.client('s3')
     
+    # Initialize Google GenAI client
     try:
         api_key = os.getenv(API_KEY_NAME)
-        if not api_key: raise ValueError(f"Environment variable {API_KEY_NAME} not set.")
+        if not api_key:
+            raise ValueError(f"Environment variable {API_KEY_NAME} not set.")
         genai_client = genai.Client(api_key=api_key)
         logging.info(f"Google GenAI Client initialized for model {MODEL_NAME}")
-    except Exception as e: 
+    except Exception as e:
         logging.error(f"Google GenAI Client init failed: {e}")
         return
 
@@ -893,7 +1056,7 @@ async def main(symbol_arg=None, mapping_csv_path=None):
             mapping_data = load_statement_mapping(mapping_csv_content)
             logging.info(f"Loaded statement mapping data for {len(mapping_data)} symbols.")
             
-            # Log some stats about mapping data for debugging
+            # Log mapping data statistics
             all_none_symbols = []
             llm_needed_symbols = []
             
@@ -909,43 +1072,49 @@ async def main(symbol_arg=None, mapping_csv_path=None):
             
         except Exception as e:
             logging.error(f"Failed to load mapping CSV from {mapping_csv_path}: {e}")
-            # Continue without mapping data
     
+    # Determine symbols to process
     symbols_to_process = []
-    if symbol_arg: 
+    if symbol_arg:
         symbols_to_process.append(symbol_arg.upper())
         logging.info(f"Processing symbol: {symbol_arg}")
     else:
         logging.info(f"Listing symbols in s3://{S3_BUCKET}/{S3_BASE_PREFIX}")
         paginator = s3_client.get_paginator('list_objects_v2')
         try:
-            response_iterator = paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_BASE_PREFIX, Delimiter='/')
+            response_iterator = paginator.paginate(
+                Bucket=S3_BUCKET,
+                Prefix=S3_BASE_PREFIX,
+                Delimiter='/'
+            )
             for page in response_iterator:
                 for prefix_data in page.get('CommonPrefixes', []):
                     prefix = prefix_data.get('Prefix')
                     symbol = prefix.replace(S3_BASE_PREFIX, '', 1).strip('/') if prefix else None
-                    symbol and symbols_to_process.append(symbol.upper())
+                    if symbol:
+                        symbols_to_process.append(symbol.upper())
+            
             # Sort symbols alphabetically
             symbols_to_process.sort()
             logging.info(f"Found symbols: {symbols_to_process}")
-            if not symbols_to_process: 
+            if not symbols_to_process:
                 logging.warning("No symbols found.")
                 return
-        except Exception as e: 
+        except Exception as e:
             logging.error(f"S3 symbol listing error: {e}")
             return
 
+    # Initialize semaphore for rate limiting
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
     symbols_to_process = [s for s in symbols_to_process if s.lower()]
     
-    # Process each symbol sequentially but process files within each symbol concurrently
+    # Process each symbol
     for symbol in symbols_to_process:
         logging.info(f"Processing symbol: {symbol}")
         symbol_prefix = f"{S3_BASE_PREFIX}{symbol}/"
         
-        # Get CSV files for this symbol
         try:
+            # Get CSV files for this symbol
             csv_keys = await list_csv_files(s3_client, S3_BUCKET, symbol_prefix)
             if not csv_keys:
                 logging.warning(f"No CSV files found for symbol {symbol}.")
@@ -953,14 +1122,17 @@ async def main(symbol_arg=None, mapping_csv_path=None):
             logging.info(f"Found {len(csv_keys)} CSV files for symbol {symbol}.")
             
             # Process all files for this symbol concurrently
-            # Pass mapping_data to each worker
-            processing_tasks = [worker(semaphore, key, s3_client, genai_client, mapping_data) for key in csv_keys]
+            processing_tasks = [
+                worker(semaphore, key, s3_client, genai_client, mapping_data)
+                for key in csv_keys
+            ]
             task_results = await asyncio.gather(*processing_tasks)
             
             # Collect results for this symbol
             symbol_records = []
             failed_count = task_results.count(None)
             success_count = len(task_results) - failed_count
+            
             for result in task_results:
                 if result is not None:
                     symbol_records.extend(result)
@@ -968,7 +1140,7 @@ async def main(symbol_arg=None, mapping_csv_path=None):
             logging.info(f"Finished {symbol}. Success: {success_count} files. Failed/Skipped: {failed_count} files.")
             logging.info(f"Extracted records for {symbol}: {len(symbol_records)}")
             
-            # Save this symbol's data to the database immediately
+            # Save this symbol's data to the database
             if symbol_records:
                 save_to_db(symbol_records, DB_NAME)
                 logging.info(f"Saved {len(symbol_records)} records for symbol {symbol} to database.")
@@ -978,11 +1150,17 @@ async def main(symbol_arg=None, mapping_csv_path=None):
     
     logging.info("JSE Data Extraction Process Finished.")
 
-
-# --- Entry Point  ---
+# --- Entry Point ---
 if __name__ == "__main__":
-    # Ensure google-generativeai is installed: pip install google-generativeai
-    parser = argparse.ArgumentParser(description="Extract JSE financial data from S3 CSVs using the Google GenAI API.")
-    parser.add_argument("-s", "--symbol", help="Specify a single equity symbol to process.", type=str, default=None)
+    parser = argparse.ArgumentParser(
+        description="Extract JSE financial data from S3 CSVs using the Google GenAI API."
+    )
+    parser.add_argument(
+        "-s",
+        "--symbol",
+        help="Specify a single equity symbol to process.",
+        type=str,
+        default=None
+    )
     args = parser.parse_args()
     asyncio.run(main(symbol_arg=args.symbol, mapping_csv_path=STATEMENT_MAPPING_CSV))

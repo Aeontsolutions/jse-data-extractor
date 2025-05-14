@@ -35,9 +35,9 @@ from copy import deepcopy
 
 # ── CONSTANTS ────────────────────────────────────────────────────────────────
 PROJECT            = "jse-datasphere"
-DATASET            = "jse_standardized"            # everything lives here
+DATASET            = "jse_standardized_dev_elroy"            # everything lives here
 LOOKUP_TABLE       = "lu_line_item_mappings"
-RAW_DATASET        = "jse_raw_financial_data"
+RAW_DATASET        = "jse_raw_financial_data_dev_elroy"
 RAW_PREFIX         = "jse_raw_"
 STD_PREFIX         = "jse_standardized_"
 STAGING_TABLE      = "staging_line_item_mapping"

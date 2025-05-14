@@ -1,0 +1,102 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# JSE Data Pipeline Guide
+
+## Core Components
+
+### 1. Initial Setup
+The pipeline begins with setting up essential lookup tables in BigQuery:
+
+- [create_mapping_csv.py](mdc:create_mapping_csv.py): Processes mapping data from Google Sheets
+- [load_to_bq.sh](mdc:load_to_bq.sh): Loads processed mappings into BigQuery
+- Creates two critical lookup tables:
+  - `lu_currency_mapping`: For currency standardization
+  - `lu_period_mapping`: For period alignment
+
+### 2. Data Extraction
+The main extraction script [jse_data_extractor_genai.py](mdc:jse_data_extractor_genai.py) handles:
+- AWS S3 CSV file retrieval
+- AI-powered data extraction using Google's Gemini
+- Financial statement processing
+- SQLite database storage
+
+### 3. Data Migration
+The migration script [sqlite_to_bq.py](mdc:sqlite_to_bq.py) manages:
+- SQLite to BigQuery data transfer
+- Table creation and management
+- Error logging and progress tracking
+
+## Data Flow
+```
+Initial Setup
+    ↓
+Google Sheet → create_mapping_csv.py → load_to_bq.sh → BigQuery Lookup Tables
+    ↓
+AWS S3 (CSV files) 
+    ↓
+Data Extraction (jse_data_extractor_genai.py)
+    ↓
+SQLite Database (jse_financial_data.db)
+    ↓
+Data Migration (sqlite_to_bq.py)
+    ↓
+Google BigQuery (jse_raw_financial_data_dev_elroy)
+```
+
+## Key Files and Their Roles
+
+### Configuration Files
+- [.env](mdc:.env): Environment variables for AWS and Google Cloud
+- [requirements.txt](mdc:requirements.txt): Python dependencies
+
+### Scripts
+- [jse_data_extractor_genai.py](mdc:jse_data_extractor_genai.py): Main extraction script
+- [sqlite_to_bq.py](mdc:sqlite_to_bq.py): BigQuery migration script
+- [create_mapping_csv.py](mdc:create_mapping_csv.py): Mapping data processor
+- [load_to_bq.sh](mdc:load_to_bq.sh): BigQuery loader
+
+### Output Files
+- `jse_financial_data.db`: SQLite database
+- `jse_extraction.log`: Extraction process logs
+- `load_failures.tsv`: Migration failure records
+
+## Development Workflow
+
+1. **Initial Setup**
+   - Set up environment variables
+   - Install dependencies
+   - Configure Google Cloud authentication
+   - Run mapping setup scripts
+
+2. **Data Processing**
+   - Run extraction script for desired symbols
+   - Monitor extraction logs
+   - Verify SQLite database output
+
+3. **Data Migration**
+   - Run migration script
+   - Check BigQuery tables
+   - Review failure logs if any
+
+## Common Tasks
+
+### Adding New Symbols
+1. Ensure symbol exists in S3 bucket
+2. Run extraction with `-s SYMBOL` flag
+3. Verify data in SQLite
+4. Run migration script
+
+### Updating Mappings
+1. Update Google Sheet
+2. Run `create_mapping_csv.py`
+3. Run `load_to_bq.sh`
+4. Verify BigQuery tables
+
+### Troubleshooting
+- Check `jse_extraction.log` for extraction issues
+- Review `load_failures.tsv` for migration problems
+- Verify BigQuery permissions and authentication
+- Ensure mapping tables are up to date
