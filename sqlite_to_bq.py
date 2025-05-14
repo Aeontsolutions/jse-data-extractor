@@ -19,7 +19,7 @@ from tqdm import tqdm
 # ── CONFIG ──────────────────────────────
 DB_PATH  = Path("jse_financial_data.db")
 PROJECT  = "jse-datasphere"
-DATASET  = "jse_raw_financial_data"
+DATASET  = "jse_raw_financial_data_dev_elroy"
 FAIL_LOG = Path("load_failures.tsv")   # tab-delimited: table_name <tab> error
 LOGLEVEL = logging.INFO
 # ────────────────────────────────────────

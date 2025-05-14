@@ -40,11 +40,11 @@ This document provides step-by-step instructions for downloading JSE period and 
 
 ## Step 3: Prepare and Run the CSV Export Script
 
-1. Create a new file named `export_csv.py` using the provided Python script
+1. Create a new file named `create_mapping_csv.py` using the provided Python script
 
 2. Run the script to generate the formatted CSV files:
    ```bash
-   python export_csv.py
+   python create_mapping_csv.py
    ```
 
 3. This will create two files:

@@ -1,0 +1,67 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# JSE Data Extractor Project Guide
+
+## Overview
+This project is a Python-based data extraction system that processes financial statements from the Jamaica Stock Exchange (JSE) using Google's Generative AI.
+
+## Key Components
+
+### Main Entry Point
+The main script is [jse_data_extractor_genai.py](mdc:jse_data_extractor_genai.py), which orchestrates the entire data extraction process.
+
+### Core Functions
+
+1. **Data Extraction**
+   - `extract_data_with_llm()`: Uses Google's Gemini AI to extract financial data
+   - `process_csv()`: Processes individual CSV files from S3
+   - `evaluate_extraction()`: Validates extraction results
+
+2. **Data Processing**
+   - `clean_value()`: Cleans and standardizes financial values
+   - `parse_date_from_filename()`: Extracts dates from filenames
+   - `build_extraction_prompt()`: Constructs AI prompts for extraction
+
+3. **Database Operations**
+   - `save_to_db()`: Stores extracted data in SQLite database
+   - Database name: `jse_financial_data.db`
+
+4. **AWS Integration**
+   - `list_csv_files()`: Lists CSV files in S3 bucket
+   - Uses boto3 for AWS S3 operations
+
+### Configuration
+- Environment variables required:
+  - `GOOGLE_VERTEX_API_KEY`: Google AI API key
+  - `AWS_ACCESS_KEY_ID`: AWS access key
+  - `AWS_SECRET_ACCESS_KEY`: AWS secret key
+  - `AWS_REGION`: AWS region (default: us-east-1)
+  - `CONCURRENCY_LIMIT`: Number of concurrent processing tasks
+
+### Data Flow
+1. List CSV files from S3
+2. Process each file concurrently
+3. Extract data using AI
+4. Validate extraction results
+5. Store in SQLite database
+
+### Output
+- Creates SQLite tables for each stock symbol
+- Stores financial line items with metadata
+- Includes extraction timestamps and validation results
+
+## Usage
+Run the script with optional symbol argument:
+```bash
+python jse_data_extractor_genai.py -s SYMBOL
+```
+
+## Dependencies
+- google-generativeai
+- boto3
+- sqlite3
+- asyncio
+- python-dotenv
