@@ -65,17 +65,17 @@ RESPONSE_SCHEMA_DICT = {
                     "description": "Whether the statement is for the Group or Company level derived from filename.",
                     "enum": ["group", "company"]
                 },
-                "trailing_zeros": {
-                    "type": "STRING",
-                    "description": "From the column headings, determine if trailing zeros should be added to the values. This can be Y or N.",
-                    "enum": ["Y", "N"]
+                "multiplication_factor": {
+                    "type": "NUMBER",
+                    "description": "The factor by which the line item values should be multiplied based on the column headings. Common values are 1 (no multiplication), 1000 (thousands), 1000000 (millions).",
+                    "minimum": 1
                 },
                 "report_date": {
                     "type": "STRING",
                     "description": "Taken from the filename but conformed to the format %Y-%m-%d eg. 2024-11-30" # Corrected format specifier
                 }
             },
-            "required": ["statement_type", "period", "group_or_company", "report_date", "trailing_zeros"]
+            "required": ["statement_type", "period", "group_or_company", "report_date", "multiplication_factor"]
         },
         "line_items": {
             "type": "ARRAY",
@@ -379,8 +379,12 @@ def build_extraction_prompt(filename: str, csv_content: str, previous_output: Op
             *   Hints: 'three_months' -> "Q1", 'six_months' -> "Q2", 'nine_months' -> "Q3". If the file is from an 'audited_financial_statements' directory OR indicates 'year_ended', choose "FY". Assume standard quarter ends unless filename strongly implies otherwise (e.g., a non-standard year-end).
         *   `group_or_company`: Determine if the statement is for the Group or Company level. Choose EXACTLY ONE from: ["group", "company"].
             *   Hints: 'group' or 'consolidated' in filename -> "group". 'company' explicitly in filename (and not 'group'/'consolidated') -> "company". Default to "group" if ambiguous or neither term is present.
-        * `trailing_zeros`: Determines if trailing zeros should be added to the line item value in downstream processing.
-            * Hints: `Y` should be entered when there are trailing zeros, `N` otherwise. You should use the column headings as a hint. YOU SHOULD NOT ADD TRAILING ZEROS TO THE LINE ITEM VALUES ON YOUR OWN.
+        * `multiplication_factor`: The factor by which the line item values should be multiplied based on the column headings.
+            * Hints: Look for indicators in column headers like:
+                - "$'000" or "thousands" -> use 1000
+                - "$'m" or "millions" -> use 1000000
+                - No indicator or "$" -> use 1
+            * You should NOT multiply the values yourself, just identify the factor.
         * `report_date`: This is the date for the given report in the format %Y-%MM-%D
             * Hints: Use the file name to extract the report date. eg. 2024-11-30
     2.  **Line Item Extraction (Based on CSV Content):**
@@ -593,7 +597,7 @@ async def evaluate_extraction(genai_client: genai.Client, filename: str, csv_con
     **Extraction Output to Evaluate:**\n```json\n{json.dumps(extraction_output, indent=2)}\n```
 
     **Evaluation Steps & Criteria:**
-    1. **Review Metadata:** Check if `metadata_predictions` (statement_type, period, group_or_company, trailing_zeros, report_date) correctly follow rules based ONLY on **Filename**. Is `report_date` %Y-%m-%d? Check required fields.
+    1. **Review Metadata:** Check if `metadata_predictions` (statement_type, period, group_or_company, multiplication_factor, report_date) correctly follow rules based ONLY on **Filename**. Is `report_date` %Y-%m-%d? Check required fields.
     2. **Check Period Completeness:** Examine CSV columns. Does `line_items` include entries for *all* relevant time periods found? Mark `missing_periods_found` = true if missed.
     3. **Check Grouped Totals:** Look for groupings (Current Assets, Total Liabilities...). Does `line_items` include entries for these *grouping headings/totals* themselves? Mark `missing_grouped_totals_found` = true if missed.
         - This is a really important check. Some things I would keep a close eye out for are that your Balance Sheets will often have the Asset and Liability figures grouped so you should ensure these are there.
@@ -757,7 +761,7 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mappin
     # Original group_or_company from LLM extraction
     original_group_or_company = metadata.get("group_or_company")
     
-    trailing_zeros = metadata.get("trailing_zeros") # Flag 'Y'/'N'
+    multiplication_factor = metadata.get("multiplication_factor") # Flag 'Y'/'N'
     report_date = metadata.get("report_date") # LLM extracted date
     
     # --- NEW: Determine group or company level using mapping data ---
@@ -815,14 +819,14 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mappin
         try:
             li_value_float = float(li_value_raw) # Directly try float as schema is NUMBER
             # Apply trailing zeros based on the flag from metadata
-            # Note: User code compared trailing_zeros directly, assuming 'Y' or 'N' string
-            # li_value_float = li_value_float * 1000 if trailing_zeros == "Y" else li_value_float
+            # Note: User code compared multiplication_factor directly, assuming 'Y' or 'N' string
+            # li_value_float = li_value_float * 1000 if multiplication_factor == "Y" else li_value_float
         except (ValueError, TypeError) as e: # Added TypeError
             logging.debug(f"Value conversion to float failed '{li_name}'='{li_value_raw}' in {filename}: {e}.")
             # Attempt cleanup ONLY if conversion fails (fallback)
             li_value_cleaned = clean_value(str(li_value_raw))
             if li_value_cleaned is not None:
-                # li_value_float = li_value_cleaned * 1000 if trailing_zeros == "Y" else li_value_cleaned
+                # li_value_float = li_value_cleaned * 1000 if multiplication_factor == "Y" else li_value_cleaned
                 logging.debug(f"Fallback clean_value succeeded for '{li_name}'='{li_value_raw}'.")
             else:
                 li_value_float = None # Set to None if both direct float and clean_value fail
@@ -834,7 +838,7 @@ async def process_csv(s3_key: str, s3_client, genai_client: genai.Client, mappin
             "line_item": str(li_name).strip(),
             "line_item_value": li_value_float, # Use the processed float value
             "period_length": li_period_length,
-            "trailing_zeros": trailing_zeros
+            "multiplication_factor": multiplication_factor
         })
 
     logging.info(f"Structured {len(records_for_db)} records for {filename} from final attempt.") # Updated log message slightly
@@ -854,9 +858,9 @@ def save_to_db(records: list, db_path: str):
             table_name = f"jse_raw_{symbol}"
             logging.info(f"Saving {len(symbol_records)} records for '{symbol}' to '{table_name}'")
             cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-            cursor.execute(f"""CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, csv_path TEXT, statement TEXT, report_date DATE, year INTEGER, period TEXT, period_type TEXT, group_or_company_level TEXT, line_item TEXT, line_item_value REAL, period_length TEXT, extraction_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, trailing_zeros TEXT, UNIQUE(csv_path, line_item, period_length))""")
-            insert_data = [(r['symbol'], r['csv_path'], r['statement'], r['report_date'], r['year'], r['period'], r['period_type'], r['group_or_company_level'], r['line_item'], r['line_item_value'], r['period_length'], r['trailing_zeros']) for r in symbol_records]
-            cursor.executemany(f"""INSERT INTO {table_name} (symbol, csv_path, statement, report_date, year, period, period_type, group_or_company_level, line_item, line_item_value, period_length, trailing_zeros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(csv_path, line_item, period_length) DO UPDATE SET statement=excluded.statement, report_date=excluded.report_date, year=excluded.year, period=excluded.period, period_type=excluded.period_type, group_or_company_level=excluded.group_or_company_level, line_item_value=excluded.line_item_value, extraction_timestamp=CURRENT_TIMESTAMP, trailing_zeros=excluded.trailing_zeros""", insert_data)
+            cursor.execute(f"""CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, csv_path TEXT, statement TEXT, report_date DATE, year INTEGER, period TEXT, period_type TEXT, group_or_company_level TEXT, line_item TEXT, line_item_value REAL, period_length TEXT, extraction_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, multiplication_factor REAL, UNIQUE(csv_path, line_item, period_length))""")
+            insert_data = [(r['symbol'], r['csv_path'], r['statement'], r['report_date'], r['year'], r['period'], r['period_type'], r['group_or_company_level'], r['line_item'], r['line_item_value'], r['period_length'], r['multiplication_factor']) for r in symbol_records]
+            cursor.executemany(f"""INSERT INTO {table_name} (symbol, csv_path, statement, report_date, year, period, period_type, group_or_company_level, line_item, line_item_value, period_length, multiplication_factor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(csv_path, line_item, period_length) DO UPDATE SET statement=excluded.statement, report_date=excluded.report_date, year=excluded.year, period=excluded.period, period_type=excluded.period_type, group_or_company_level=excluded.group_or_company_level, line_item_value=excluded.line_item_value, extraction_timestamp=CURRENT_TIMESTAMP, multiplication_factor=excluded.multiplication_factor""", insert_data)
         conn.commit()
         logging.info(f"Saved data for {len(records_by_symbol)} symbols.")
     except sqlite3.Error as e: logging.error(f"DB error: {e}"); conn and conn.rollback()

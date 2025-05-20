@@ -21,7 +21,7 @@ Output (all inside dataset **jse_standardized**):
        …plus every original raw column
 """
 
-import argparse, asyncio, json, logging, re, sys
+import argparse, asyncio, json, logging, re, sys, time
 from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Tuple
@@ -35,9 +35,9 @@ from copy import deepcopy
 
 # ── CONSTANTS ────────────────────────────────────────────────────────────────
 PROJECT            = "jse-datasphere"
-DATASET            = "jse_standardized"            # everything lives here
+DATASET            = "jse_standardized_dev_elroy"            # everything lives here
 LOOKUP_TABLE       = "lu_line_item_mappings"
-RAW_DATASET        = "jse_raw_financial_data"
+RAW_DATASET        = "jse_raw_financial_data_dev_elroy"
 RAW_PREFIX         = "jse_raw_"
 STD_PREFIX         = "jse_standardized_"
 STAGING_TABLE      = "staging_line_item_mapping"
@@ -161,7 +161,20 @@ async def map_canonical_to_raw(
             config=cfg,
         )
 
-    resp = await asyncio.to_thread(sync_call)
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = await asyncio.to_thread(sync_call)
+            break
+        except Exception as e:
+            logging.error(f"LLM API call failed on attempt {attempt}: {e}")
+            if attempt == max_retries:
+                logging.error("LLM API call failed after %d attempts. Returning LLM_ERROR for all items.", max_retries)
+                return {c: "LLM_ERROR" for c in canonical_items}
+            time.sleep(5)
+    else:
+        return {c: "LLM_ERROR" for c in canonical_items}
+
     try:
         arr = json.loads(resp.text)
         return {d["company_line_item"]: d["raw_match"] for d in arr}
@@ -199,6 +212,13 @@ def load_lookup(symbol: str):
 
 # ── STAGING TABLES ───────────────────────────────────────────────────────────
 def recreate_staging():
+    # Create dataset if it doesn't exist
+    try:
+        bq.get_dataset(f"{PROJECT}.{DATASET}")
+    except Exception:
+        logging.info("Creating dataset %s.%s", PROJECT, DATASET)
+        bq.create_dataset(f"{PROJECT}.{DATASET}", exists_ok=True)
+
     schema_map = [
     bigquery.SchemaField("run_id", "STRING"),
     bigquery.SchemaField("symbol", "STRING"),
@@ -274,6 +294,12 @@ async def process_company(symbol: str, run: str):
         snapshot_date = (
             choose_snapshot(list(dated_snaps), rd.date()) if dated_snaps else None
         )
+        if snapshot_date is None or str(snapshot_date) == "NaT" or snapshot_date not in dated_snaps:
+            logging.warning(
+                "Skipping slice for symbol=%s, report_date=%s, period=%s, period_type=%s, group_or_company_level=%s due to missing or invalid snapshot_date (%s)",
+                symbol, rd, per, ptyp, gcl, snapshot_date
+            )
+            return
 
         # ── build lookup structures (variant → (canonical, std)) ────────────────
         variant_map: Dict[str, Tuple[str, str]] = {}

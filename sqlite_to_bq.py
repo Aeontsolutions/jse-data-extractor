@@ -9,6 +9,7 @@ Requires: google-cloud-bigquery, pandas, sqlalchemy, tqdm
 
 import logging
 import time
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -19,7 +20,7 @@ from tqdm import tqdm
 # ── CONFIG ──────────────────────────────
 DB_PATH  = Path("jse_financial_data.db")
 PROJECT  = "jse-datasphere"
-DATASET  = "jse_raw_financial_data"
+DATASET  = "jse_raw_financial_data_dev_elroy"
 FAIL_LOG = Path("load_failures.tsv")   # tab-delimited: table_name <tab> error
 LOGLEVEL = logging.INFO
 # ────────────────────────────────────────
@@ -36,6 +37,10 @@ def record_failure(table: str, err: Exception) -> None:
         f.write(f"{table}\t{err}\n")
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Load SQLite tables to BigQuery")
+    parser.add_argument("-s", "--symbol", help="Specific symbol to process (e.g., JPS)", type=str)
+    args = parser.parse_args()
+
     t0 = time.time()
     logging.info("🔌  SQLite → %s", DB_PATH.resolve())
     engine    = create_engine(f"sqlite:///{DB_PATH}")
@@ -47,7 +52,22 @@ def main() -> None:
 
     FAIL_LOG.unlink(missing_ok=True)  # start fresh each run
 
-    for tbl in tqdm(inspector.get_table_names(), desc="loading", ncols=80):
+    # Get all tables or filter for specific symbol
+    tables = inspector.get_table_names()
+    if args.symbol:
+        # Case-insensitive matching
+        symbol_table = f"jse_raw_{args.symbol.upper()}"
+        matching_tables = [t for t in tables if t.upper() == symbol_table.upper()]
+        if matching_tables:
+            tables = matching_tables
+            logging.info(f"Processing only table for symbol: {args.symbol}")
+        else:
+            logging.error(f"No table found for symbol: {args.symbol}")
+            return
+    else:
+        logging.info("Processing all tables")
+
+    for tbl in tqdm(tables, desc="loading", ncols=80):
         step_start = time.time()
         try:
             logging.info("   ↳ %s: pull from SQLite", tbl)

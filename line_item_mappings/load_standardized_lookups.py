@@ -35,7 +35,7 @@ OUT_LU_INDS     = Path("lu_industries.csv")
 OUT_LU_EXC      = Path("lu_line_item_exceptions.csv")
 
 BQ_PROJECT      = "jse-datasphere"
-BQ_DATASET      = "jse_standardized"
+BQ_DATASET      = "jse_standardized_dev_elroy"
 LOG_LEVEL       = logging.INFO
 LOG_FILE        = "build_and_load_lookups.log"
 # ────────────────────────────────────────────────────────────────────────────

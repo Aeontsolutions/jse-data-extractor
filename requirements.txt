@@ -7,3 +7,5 @@ tk==0.1.0
 pandas_gbq==0.28.0
 sqlalchemy==2.0.31
 tqdm==4.67.0
+google-cloud-bigquery==3.17.2
+google-cloud-secret-manager==2.18.1
