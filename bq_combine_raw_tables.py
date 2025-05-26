@@ -2,7 +2,7 @@ from google.cloud import bigquery
 
 # Set these to your project and dataset
 PROJECT_ID = "jse-datasphere"
-DATASET_ID = "jse_raw_financial_data"
+DATASET_ID = "jse_raw_financial_data_dev_elroy"
 ANALYTICAL_TABLE = "jse_raw_analytical"
 
 client = bigquery.Client(project=PROJECT_ID)
@@ -21,7 +21,7 @@ first_table = client.get_table(first_table_ref)
 columns = [field.name for field in first_table.schema]
 
 # Columns to cast
-cast_columns = ["report_date", "extraction_timestamp", "trailing_zeros"]
+cast_columns = ["report_date", "extraction_timestamp"]
 
 def build_select(table):
     select_cols = []
