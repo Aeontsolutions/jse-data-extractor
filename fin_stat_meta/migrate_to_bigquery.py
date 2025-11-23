@@ -90,13 +90,14 @@ def create_bigquery_table():
     table_ref = f"{client.project}.{dataset_id}.{table_id}"
 
     # Define the schema
-    # symbol,statement_type,period,period_detail,report_type,consolidation_type,status,s3_path,pdf_folder_path
+    # symbol,statement_type,period,period_detail,report_type,consolidation_type,status,s3_path,pdf_folder_path,period_quarter
     schema = [
         bigquery.SchemaField("symbol", "STRING"),
         bigquery.SchemaField("statement_type", "STRING"),
         bigquery.SchemaField("period", "STRING"),
         bigquery.SchemaField("period_detail", "STRING"),
         bigquery.SchemaField("period_end_date", "DATE"),
+        bigquery.SchemaField("period_quarter", "STRING"),  # New field from lu_period_mapping
         bigquery.SchemaField("report_type", "STRING"),
         bigquery.SchemaField("consolidation_type", "STRING"),
         bigquery.SchemaField("status", "STRING"),
@@ -116,6 +117,69 @@ def load_csv_to_bigquery(csv_path, table_ref):
     df = pd.read_csv(csv_path)
     df.columns = df.columns.str.lower().str.replace(' ', '_')
     
+    print(f"Original data shape: {df.shape}")
+    
+    # Perform join with lu_period_mapping to get period_quarter data
+    dataset_id = "jse_raw_financial_data_dev_elroy"
+    period_mapping_table = f"{client.project}.{dataset_id}.lu_period_mapping"
+    
+    print("Fetching period mapping data from BigQuery...")
+    period_mapping_query = f"""
+    SELECT 
+        symbol,
+        period as period_quarter,
+        PARSE_DATE('%Y-%m-%d', report_date) as report_date,
+        PARSE_DATE('%Y-%m-%d', year_end) as year_end
+    FROM `{period_mapping_table}`
+    """
+    
+    try:
+        period_df = client.query(period_mapping_query).to_dataframe()
+        print(f"Period mapping data shape: {period_df.shape}")
+        
+        # Debug: Show sample data from both dataframes
+        print("\nSample from main dataframe:")
+        print(df[['symbol', 'period_end_date']].head())
+        print(f"period_end_date dtype: {df['period_end_date'].dtype}")
+        
+        print("\nSample from period mapping dataframe:")
+        print(period_df[['symbol', 'report_date']].head())
+        print(f"report_date dtype: {period_df['report_date'].dtype}")
+        
+        # Ensure both date columns are datetime objects for proper joining
+        df['period_end_date'] = pd.to_datetime(df['period_end_date'], errors='coerce')
+        period_df['report_date'] = pd.to_datetime(period_df['report_date'], errors='coerce')
+        
+        print(f"\nAfter conversion - period_end_date dtype: {df['period_end_date'].dtype}")
+        print(f"After conversion - report_date dtype: {period_df['report_date'].dtype}")
+        
+        # Prepare the main dataframe for joining
+        # We'll join on symbol and period_end_date (from main df) = report_date (from period mapping)
+        print("Performing left join with period mapping...")
+        df_with_period = df.merge(
+            period_df[['symbol', 'period_quarter', 'report_date']], 
+            left_on=['symbol', 'period_end_date'], 
+            right_on=['symbol', 'report_date'], 
+            how='left'
+        )
+        
+        # Drop the duplicate report_date column from the join
+        if 'report_date' in df_with_period.columns:
+            df_with_period = df_with_period.drop(columns=['report_date'])
+            
+        print(f"After join data shape: {df_with_period.shape}")
+        print(f"Records with period_quarter data: {df_with_period['period_quarter'].notna().sum()}")
+        print(f"Records without period_quarter data: {df_with_period['period_quarter'].isna().sum()}")
+        
+        # Update df to use the joined version
+        df = df_with_period
+        
+    except Exception as e:
+        print(f"Warning: Could not join with period mapping data: {e}")
+        print("Proceeding without period_quarter data...")
+        # Add empty period_quarter column if join fails
+        df['period_quarter'] = None
+    
     # Rename columns to match schema
     df.rename(columns={
         'symbol': 'symbol',
@@ -129,6 +193,24 @@ def load_csv_to_bigquery(csv_path, table_ref):
         's3_path': 's3_path',
         'pdf_folder_path': 'pdf_folder_path'
     }, inplace=True)
+    
+    # Deduplicate records: keep unique records, prefer status=1 over blank for duplicates
+    print(f"Original records: {len(df)}")
+    
+    # Define grouping columns for duplicate detection
+    grouping_cols = ['symbol', 'period_end_date', 'report_type', 'consolidation_type']
+    
+    # Sort by grouping columns and status (putting status=1 first, blank/NaN last)
+    df_deduplicated = (df
+        .sort_values(grouping_cols + ['status'], na_position='last')
+        .drop_duplicates(subset=grouping_cols, keep='first')
+    )
+    
+    print(f"After deduplication: {len(df_deduplicated)}")
+    print(f"Removed {len(df) - len(df_deduplicated)} duplicate records")
+    
+    # Update df to use the deduplicated version
+    df = df_deduplicated
     
     # Convert all string columns to string type to avoid mixed type issues
     string_columns = ['symbol', 'statement_type', 'period', 'period_detail', 'report_type', 'consolidation_type', 'status', 's3_path', 'pdf_folder_path']
@@ -168,6 +250,7 @@ def load_csv_to_bigquery(csv_path, table_ref):
         "period",
         "period_detail",
         "period_end_date",
+        "period_quarter",  # New field from lu_period_mapping join
         "report_type",
         "consolidation_type",
         "status",
@@ -180,12 +263,14 @@ def load_csv_to_bigquery(csv_path, table_ref):
     # Use the correct schema that matches the table definition
     job_config = bigquery.LoadJobConfig(
         autodetect=False,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,  # Ensure overwrite
         schema=[
             bigquery.SchemaField("symbol", "STRING"),
             bigquery.SchemaField("statement_type", "STRING"),
             bigquery.SchemaField("period", "STRING"),
             bigquery.SchemaField("period_detail", "STRING"),
             bigquery.SchemaField("period_end_date", "DATE"),
+            bigquery.SchemaField("period_quarter", "STRING"),  # New field from lu_period_mapping join
             bigquery.SchemaField("report_type", "STRING"),
             bigquery.SchemaField("consolidation_type", "STRING"),
             bigquery.SchemaField("status", "STRING"),
@@ -203,7 +288,7 @@ def load_csv_to_bigquery(csv_path, table_ref):
 
 
 def main():
-    csv_path = "/Users/galbraithelroy/Documents/jse-data-extractor/csvs/financial_statements_with_s3_paths_enhanced_updated_v1 - financial_statements_with_s3_paths_enhanced_s3_6_with_adjusted_standard_id.csv"
+    csv_path = "/Users/galbraithelroy/Documents/jse-data-extractor/fin_stat_meta/financial_statements_metadata_3_09_2025_with_ID - financial_statements_metadata_3_09_2025 - financial_statements_metadata_3_09_2025 (1).csv"
     
     # Create the table
     table_ref = create_bigquery_table()
