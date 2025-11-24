@@ -80,6 +80,46 @@ def extract_date_from_period_detail(period_detail):
     print(f"Warning: Could not parse date from '{period_detail}' (extracted: '{date_str}')")
     return None
 
+def extract_quarter_from_period_detail(row):
+    """
+    Extract quarter information from period_detail based on statement_type.
+    
+    Rules:
+    - If statement_type is 'audited', return 'FY' (Fiscal Year)
+    - If statement_type is 'unaudited', extract Q1, Q2, Q3, or Q4 from period_detail
+    
+    Examples:
+    - audited, "30-Sept-15" -> "FY"
+    - unaudited, "Q1 (31-Dec-14)" -> "Q1"
+    - unaudited, "Q2 (31-Mar-15)" -> "Q2"
+    """
+    statement_type = row.get('statement_type', '')
+    period_detail = row.get('period_detail', '')
+    
+    # Handle missing or invalid values
+    if pd.isna(statement_type) or pd.isna(period_detail):
+        return None
+    
+    statement_type = str(statement_type).strip().lower()
+    period_detail = str(period_detail).strip()
+    
+    # If audited, return FY
+    if statement_type == 'audited':
+        return 'FY'
+    
+    # If unaudited, extract quarter (Q1, Q2, Q3, Q4)
+    if statement_type == 'unaudited':
+        # Search for Q1, Q2, Q3, or Q4 in the period_detail
+        quarter_match = re.search(r'Q([1-4])', period_detail, re.IGNORECASE)
+        if quarter_match:
+            return f'Q{quarter_match.group(1)}'
+        else:
+            print(f"Warning: Unaudited statement without quarter info in period_detail: '{period_detail}'")
+            return None
+    
+    # For any other statement type, return None
+    return None
+
 def create_bigquery_table():
     # Initialize BigQuery client
     client = bigquery.Client(project=os.getenv("GOOGLE_PROJECT_ID"))
@@ -119,66 +159,62 @@ def load_csv_to_bigquery(csv_path, table_ref):
     
     print(f"Original data shape: {df.shape}")
     
-    # Perform join with lu_period_mapping to get period_quarter data
-    dataset_id = "jse_raw_financial_data_dev_elroy"
-    period_mapping_table = f"{client.project}.{dataset_id}.lu_period_mapping"
+    # Extract quarter information from period_detail based on statement_type
+    print("Extracting quarter information from period_detail...")
+    df['period_quarter'] = df.apply(extract_quarter_from_period_detail, axis=1)
     
-    print("Fetching period mapping data from BigQuery...")
-    period_mapping_query = f"""
-    SELECT 
-        symbol,
-        period as period_quarter,
-        PARSE_DATE('%Y-%m-%d', report_date) as report_date,
-        PARSE_DATE('%Y-%m-%d', year_end) as year_end
-    FROM `{period_mapping_table}`
-    """
+    # Show statistics
+    print(f"Records with period_quarter data: {df['period_quarter'].notna().sum()}")
+    print(f"Records without period_quarter data: {df['period_quarter'].isna().sum()}")
     
-    try:
-        period_df = client.query(period_mapping_query).to_dataframe()
-        print(f"Period mapping data shape: {period_df.shape}")
-        
-        # Debug: Show sample data from both dataframes
-        print("\nSample from main dataframe:")
-        print(df[['symbol', 'period_end_date']].head())
-        print(f"period_end_date dtype: {df['period_end_date'].dtype}")
-        
-        print("\nSample from period mapping dataframe:")
-        print(period_df[['symbol', 'report_date']].head())
-        print(f"report_date dtype: {period_df['report_date'].dtype}")
-        
-        # Ensure both date columns are datetime objects for proper joining
-        df['period_end_date'] = pd.to_datetime(df['period_end_date'], errors='coerce')
-        period_df['report_date'] = pd.to_datetime(period_df['report_date'], errors='coerce')
-        
-        print(f"\nAfter conversion - period_end_date dtype: {df['period_end_date'].dtype}")
-        print(f"After conversion - report_date dtype: {period_df['report_date'].dtype}")
-        
-        # Prepare the main dataframe for joining
-        # We'll join on symbol and period_end_date (from main df) = report_date (from period mapping)
-        print("Performing left join with period mapping...")
-        df_with_period = df.merge(
-            period_df[['symbol', 'period_quarter', 'report_date']], 
-            left_on=['symbol', 'period_end_date'], 
-            right_on=['symbol', 'report_date'], 
-            how='left'
-        )
-        
-        # Drop the duplicate report_date column from the join
-        if 'report_date' in df_with_period.columns:
-            df_with_period = df_with_period.drop(columns=['report_date'])
-            
-        print(f"After join data shape: {df_with_period.shape}")
-        print(f"Records with period_quarter data: {df_with_period['period_quarter'].notna().sum()}")
-        print(f"Records without period_quarter data: {df_with_period['period_quarter'].isna().sum()}")
-        
-        # Update df to use the joined version
-        df = df_with_period
-        
-    except Exception as e:
-        print(f"Warning: Could not join with period mapping data: {e}")
-        print("Proceeding without period_quarter data...")
-        # Add empty period_quarter column if join fails
-        df['period_quarter'] = None
+    # Show value counts for period_quarter
+    print("\nPeriod quarter distribution:")
+    print(df['period_quarter'].value_counts(dropna=False))
+    
+    # Show sample extractions
+    print("\nSample quarter extractions:")
+    sample_data = df[['statement_type', 'period_detail', 'period_quarter']].head(10)
+    print(sample_data.to_string(index=False))
+    
+    # Validation: Check business rules
+    print("\n=== VALIDATION ===")
+    
+    # Rule 1: If statement_type is audited, period_quarter should be FY
+    audited_df = df[df['statement_type'].str.lower() == 'audited']
+    audited_with_fy = audited_df[audited_df['period_quarter'] == 'FY']
+    audited_without_fy = audited_df[audited_df['period_quarter'] != 'FY']
+    
+    print(f"\nAudited statements: {len(audited_df)}")
+    print(f"  - With period_quarter='FY': {len(audited_with_fy)}")
+    print(f"  - Without period_quarter='FY': {len(audited_without_fy)}")
+    
+    if len(audited_without_fy) > 0:
+        print("  WARNING: Some audited statements don't have period_quarter='FY':")
+        print(audited_without_fy[['statement_type', 'period_detail', 'period_quarter']].head())
+    
+    # Rule 2: If statement_type is unaudited, period_detail should have Q1, Q2, Q3, or Q4
+    unaudited_df = df[df['statement_type'].str.lower() == 'unaudited']
+    unaudited_with_quarter = unaudited_df[unaudited_df['period_quarter'].isin(['Q1', 'Q2', 'Q3', 'Q4'])]
+    unaudited_without_quarter = unaudited_df[~unaudited_df['period_quarter'].isin(['Q1', 'Q2', 'Q3', 'Q4'])]
+    
+    print(f"\nUnaudited statements: {len(unaudited_df)}")
+    print(f"  - With period_quarter (Q1-Q4): {len(unaudited_with_quarter)}")
+    print(f"  - Without period_quarter (Q1-Q4): {len(unaudited_without_quarter)}")
+    
+    if len(unaudited_without_quarter) > 0:
+        print("  WARNING: Some unaudited statements don't have a valid quarter (Q1-Q4):")
+        print(unaudited_without_quarter[['statement_type', 'period_detail', 'period_quarter']].head())
+    
+    # Rule 3: If statement_type is audited, period_detail should NOT contain Q1, Q2, Q3, Q4
+    audited_with_q_in_detail = audited_df[audited_df['period_detail'].str.contains(r'Q[1-4]', na=False, regex=True)]
+    
+    print(f"\nAudited statements with Q1-Q4 in period_detail: {len(audited_with_q_in_detail)}")
+    
+    if len(audited_with_q_in_detail) > 0:
+        print("  WARNING: Some audited statements have Q1-Q4 in period_detail:")
+        print(audited_with_q_in_detail[['statement_type', 'period_detail', 'period_quarter']].head())
+    
+    print("\n=== END VALIDATION ===\n")
     
     # Rename columns to match schema
     df.rename(columns={
