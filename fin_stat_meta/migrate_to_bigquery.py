@@ -4,6 +4,8 @@ import os
 import re
 from datetime import datetime
 from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 load_dotenv()
 
@@ -11,6 +13,109 @@ load_dotenv()
 # Set up credentials
 # Make sure you have set GOOGLE_APPLICATION_CREDENTIALS environment variable
 # export GOOGLE_APPLICATION_CREDENTIALS="path/to/your/credentials.json"
+
+def fetch_csv_from_google_sheets(sheet_url, gid=None):
+    """
+    Fetch CSV data directly from a Google Sheets URL using Google Cloud credentials.
+
+    Args:
+        sheet_url: The Google Sheets URL (can be edit or view URL)
+        gid: The sheet ID (gid parameter). If None, will try to extract from URL or use first sheet
+
+    Returns:
+        pandas DataFrame with the sheet data
+
+    Note:
+        Uses the same Google Cloud credentials as BigQuery (GOOGLE_APPLICATION_CREDENTIALS)
+    """
+    # Extract the spreadsheet ID from the URL
+    if '/d/' in sheet_url:
+        sheet_id = sheet_url.split('/d/')[1].split('/')[0]
+    else:
+        raise ValueError("Invalid Google Sheets URL format")
+
+    # Extract gid from URL if not provided
+    sheet_name = None
+    if gid is None:
+        if 'gid=' in sheet_url:
+            gid = sheet_url.split('gid=')[1].split('&')[0].split('#')[0]
+        else:
+            gid = '0'  # Default to first sheet
+
+    print(f"Fetching data from Google Sheets...")
+    print(f"Sheet ID: {sheet_id}")
+    print(f"GID: {gid}")
+
+    try:
+        # Set up credentials using the same credentials as BigQuery
+        credentials_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+        if not credentials_path:
+            raise ValueError("GOOGLE_APPLICATION_CREDENTIALS environment variable not set")
+
+        credentials = service_account.Credentials.from_service_account_file(
+            credentials_path,
+            scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
+        )
+
+        # Build the Sheets API service
+        service = build('sheets', 'v4', credentials=credentials)
+
+        # Get spreadsheet metadata to find sheet name from gid
+        spreadsheet = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        sheets = spreadsheet.get('sheets', [])
+
+        # Find the sheet with matching gid
+        target_sheet = None
+        for sheet in sheets:
+            sheet_properties = sheet.get('properties', {})
+            if str(sheet_properties.get('sheetId')) == str(gid):
+                target_sheet = sheet_properties.get('title')
+                break
+
+        if not target_sheet:
+            # If gid not found, use the first sheet
+            target_sheet = sheets[0]['properties']['title'] if sheets else 'Sheet1'
+            print(f"Warning: Sheet with gid={gid} not found, using first sheet: {target_sheet}")
+
+        print(f"Sheet name: {target_sheet}")
+
+        # Read the data
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=target_sheet
+        ).execute()
+
+        values = result.get('values', [])
+
+        if not values:
+            print("Warning: No data found in sheet")
+            return pd.DataFrame()
+
+        # Get header row
+        headers = values[0]
+        num_columns = len(headers)
+
+        # Normalize data rows to have same number of columns as header
+        # (Google Sheets API omits trailing empty cells)
+        normalized_rows = []
+        for row in values[1:]:
+            # Pad row with empty strings if it has fewer columns than header
+            if len(row) < num_columns:
+                row = row + [''] * (num_columns - len(row))
+            # Truncate row if it has more columns than header (shouldn't happen, but just in case)
+            elif len(row) > num_columns:
+                row = row[:num_columns]
+            normalized_rows.append(row)
+
+        # Convert to DataFrame
+        df = pd.DataFrame(normalized_rows, columns=headers)
+
+        print(f"✓ Successfully fetched {len(df)} rows from Google Sheets")
+        return df
+
+    except Exception as e:
+        print(f"Error fetching data from Google Sheets: {e}")
+        raise
 
 def extract_date_from_period_detail(period_detail):
     """
@@ -120,6 +225,109 @@ def extract_quarter_from_period_detail(row):
     # For any other statement type, return None
     return None
 
+
+def build_fiscal_year_lookup(df):
+    """
+    Build a time-aware fiscal year lookup table from audited statements.
+
+    For each company, creates date ranges where:
+    - Start Range = Previous Audited Date + 1 day (or min date for first year)
+    - End Range = Current Audited Date (the fiscal year end)
+
+    A statement belongs to a fiscal year if:
+    reference_date > start_range AND reference_date <= end_range
+
+    Args:
+        df: DataFrame with 'symbol', 'statement_type', and 'reference_date' columns
+
+    Returns:
+        DataFrame with columns: symbol, fiscal_year, start_range, end_range
+    """
+    # Filter to audited statements only
+    audited_df = df[df['statement_type'].str.lower() == 'audited'].copy()
+
+    # Get unique audited dates per symbol (deduplicate by symbol + reference_date)
+    fy_dates = audited_df.groupby(['symbol', 'reference_date']).size().reset_index()[['symbol', 'reference_date']]
+    fy_dates = fy_dates.sort_values(['symbol', 'reference_date']).reset_index(drop=True)
+
+    # For each symbol, calculate the start range using lag (previous audited date + 1 day)
+    fy_dates['prev_audited_date'] = fy_dates.groupby('symbol')['reference_date'].shift(1)
+
+    # Start range is previous audited date + 1 day
+    # For the first year of each company, use a very early date
+    fy_dates['start_range'] = fy_dates['prev_audited_date'] + pd.Timedelta(days=1)
+
+    # Fill NaT (first year for each company) with a default early date
+    min_date = pd.Timestamp('1900-01-01')
+    fy_dates['start_range'] = fy_dates['start_range'].fillna(min_date)
+
+    # End range is the audited date itself (this becomes period_end_date for backward compatibility)
+    fy_dates['end_range'] = fy_dates['reference_date']
+
+    # Fiscal year is the calendar year of the audited date
+    fy_dates['fiscal_year'] = fy_dates['reference_date'].dt.year
+
+    # Select final columns
+    lookup_table = fy_dates[['symbol', 'fiscal_year', 'start_range', 'end_range']].copy()
+
+    return lookup_table
+
+
+def assign_fiscal_year(df, lookup_table):
+    """
+    Assign fiscal year and fiscal year end date to each record based on the lookup table.
+
+    A record belongs to fiscal year X if:
+    reference_date > start_range AND reference_date <= end_range
+
+    For each matching record, assigns:
+    - fiscal_year: The calendar year of the fiscal year end (INTEGER)
+    - period_end_date: The actual fiscal year end date (DATE) - for backward compatibility
+
+    Args:
+        df: DataFrame with all records (must have 'symbol' and 'reference_date')
+        lookup_table: DataFrame from build_fiscal_year_lookup()
+
+    Returns:
+        DataFrame with 'fiscal_year' and 'period_end_date' columns added
+    """
+    df = df.copy()
+
+    # Initialize columns
+    df['fiscal_year'] = None
+    df['period_end_date'] = pd.NaT  # Fiscal year end date
+
+    # Get unique symbols
+    symbols = df['symbol'].unique()
+
+    for symbol in symbols:
+        # Get rows for this symbol
+        symbol_mask = df['symbol'] == symbol
+        symbol_lookup = lookup_table[lookup_table['symbol'] == symbol]
+
+        if symbol_lookup.empty:
+            continue
+
+        # For each row of this symbol, find matching fiscal year
+        for idx in df[symbol_mask].index:
+            reference_date = df.at[idx, 'reference_date']
+
+            if pd.isna(reference_date):
+                continue
+
+            # Find the fiscal year where reference_date falls within the range
+            match = symbol_lookup[
+                (reference_date > symbol_lookup['start_range']) &
+                (reference_date <= symbol_lookup['end_range'])
+            ]
+
+            if not match.empty:
+                df.at[idx, 'fiscal_year'] = int(match.iloc[0]['fiscal_year'])
+                df.at[idx, 'period_end_date'] = match.iloc[0]['end_range']  # Fiscal year end date
+
+    return df
+
+
 def create_bigquery_table():
     # Initialize BigQuery client
     client = bigquery.Client(project=os.getenv("GOOGLE_PROJECT_ID"))
@@ -130,14 +338,16 @@ def create_bigquery_table():
     table_ref = f"{client.project}.{dataset_id}.{table_id}"
 
     # Define the schema
-    # symbol,statement_type,period,period_detail,report_type,consolidation_type,status,s3_path,pdf_folder_path,period_quarter
+    # symbol,statement_type,period,period_detail,reference_date,period_end_date,period_quarter,fiscal_year,report_type,consolidation_type,status,s3_path,pdf_folder_path
     schema = [
         bigquery.SchemaField("symbol", "STRING"),
         bigquery.SchemaField("statement_type", "STRING"),
         bigquery.SchemaField("period", "STRING"),
         bigquery.SchemaField("period_detail", "STRING"),
-        bigquery.SchemaField("period_end_date", "DATE"),
-        bigquery.SchemaField("period_quarter", "STRING"),  # New field from lu_period_mapping
+        bigquery.SchemaField("reference_date", "DATE"),  # Actual statement date (e.g., Q1 Dec 31)
+        bigquery.SchemaField("period_end_date", "DATE"),  # Fiscal year end date (for backward compatibility)
+        bigquery.SchemaField("period_quarter", "STRING"),  # Q1, Q2, Q3, Q4, or FY
+        bigquery.SchemaField("fiscal_year", "INTEGER"),  # Calendar year of the fiscal year end
         bigquery.SchemaField("report_type", "STRING"),
         bigquery.SchemaField("consolidation_type", "STRING"),
         bigquery.SchemaField("status", "STRING"),
@@ -152,12 +362,265 @@ def create_bigquery_table():
 
     return table_ref
 
-def load_csv_to_bigquery(csv_path, table_ref):
+def clean_duplicate_s3_paths(df):
+    """
+    Clean duplicate s3_path entries step-by-step with detailed logging.
+    
+    Steps:
+    1. Identify duplicates
+    2. Identify duplicates where all have blank status
+    3. Resolve blank status duplicates using statement_type inference from s3_path
+    4. Check for remaining duplicates
+    5. Resolve remaining duplicates by keeping status=1.0
+    6. Check for remaining duplicates again
+    7. Apply manual mapping for report_type misclassifications
+    8. Handle true duplicates (identical in all fields) by keeping first occurrence
+    """
+    print("\n" + "="*80)
+    print("CLEANING DUPLICATE S3_PATHS - STEP BY STEP")
+    print("="*80)
+    
+    # Manual mapping: s3_path -> correct report_type (for same file misclassified as different statement types)
+    correct_report_type_mapping = {
+        # BIL files - verified
+        's3://jse-renamed-docs-copy/CSV-Copy/BIL/audited_financial_statements/2022/bil-barita_investments_limited_consolidated_statement_of_comprehensive_income-30-september-2022.csv': 'cashflow',
+        's3://jse-renamed-docs-copy/CSV-Copy/BIL/audited_financial_statements/2024/bil-barita_investments_limited_consolidated_statement_of_comprehensive_income-30-september-2024.csv': 'income_statement',
+        's3://jse-renamed-docs-copy/CSV-Copy/BIL/unaudited_financial_statements/2020/bil-bartita_investments_limited_consolidated_statement_of_cash_flows-june-30-2020.csv': 'cashflow',
+        
+        # Other companies - verified
+        's3://jse-renamed-docs-copy/CSV-Copy/CAC/audited_financial_statements/2022/cac-cac_2000_limited_statement_of_comprehensive_income-31-october-2022.csv': 'income_statement',
+        's3://jse-renamed-docs-copy/CSV-Copy/DTL/audited_financial_statements/2018/dtl-derrimon_trading_company_limited_group_statement_of_comprehensive_income-31-december-2018.csv': 'income_statement',
+        's3://jse-renamed-docs-copy/CSV-Copy/JBG/unaudited_financial_statements/2023/jbg-jamaica_broilers_group_limited_group_statement_of_comprehensive_income-october-28-2023.csv': 'income_statement',
+        's3://jse-renamed-docs-copy/CSV-Copy/KREMI/unaudited_financial_statements/2020/kremi-caribbean_cream_ltd_unaudited_income_statement-august-31-2020.csv': 'income_statement',
+        's3://jse-renamed-docs-copy/CSV-Copy/MFS/unaudited_financial_statements/2023/mfs-MFS_capital_partners_limited_unaudited_consolidated_statement_of_financial_position-june-30-2023.csv': 'balance_sheet',
+    }
+    
+    df_working = df.copy()
+    print(f"Starting rows: {len(df_working)}")
+    print()
+    
+    # ========================================================================
+    # STEP 1: Identify duplicates
+    # ========================================================================
+    print("STEP 1: Identifying duplicates")
+    print("-" * 80)
+    duplicate_s3_paths = df_working['s3_path'].value_counts()
+    duplicate_s3_paths = duplicate_s3_paths[duplicate_s3_paths > 1].index
+    print(f"Found {len(duplicate_s3_paths)} s3_paths with duplicates")
+    
+    if len(duplicate_s3_paths) == 0:
+        print("✓ No duplicates found, skipping cleaning")
+        print("="*80 + "\n")
+        return df_working
+    
+    total_duplicate_rows = df_working[df_working['s3_path'].isin(duplicate_s3_paths)]
+    print(f"Total rows with duplicate s3_paths: {len(total_duplicate_rows)}")
+    print()
+    
+    # ========================================================================
+    # STEP 2: Identify duplicates with all blank status
+    # ========================================================================
+    print("STEP 2: Identifying duplicates with all blank status")
+    print("-" * 80)
+    
+    blank_status_duplicates = []
+    for s3_path in duplicate_s3_paths:
+        dup_rows = df_working[df_working['s3_path'] == s3_path]
+        # Check if all duplicates have blank/null status
+        if dup_rows['status'].isna().all():
+            blank_status_duplicates.append(s3_path)
+    
+    print(f"Found {len(blank_status_duplicates)} s3_paths where ALL duplicates have blank status")
+    print(f"These represent {df_working['s3_path'].isin(blank_status_duplicates).sum()} total rows")
+    print()
+    
+    # ========================================================================
+    # STEP 3: Resolve blank status duplicates using statement_type inference
+    # ========================================================================
+    print("STEP 3: Resolving blank status duplicates using statement_type from s3_path")
+    print("-" * 80)
+    
+    rows_to_drop = []
+    for s3_path in blank_status_duplicates:
+        dup_rows = df_working[df_working['s3_path'] == s3_path]
+        s3_path_lower = str(s3_path).lower()
+        
+        # Determine correct statement_type from path
+        if 'unaudited' in s3_path_lower:
+            correct_statement_type = 'unaudited'
+        else:
+            correct_statement_type = 'audited'
+        
+        # Mark incorrect rows for dropping
+        for idx, row in dup_rows.iterrows():
+            if str(row['statement_type']).lower() != correct_statement_type:
+                rows_to_drop.append(idx)
+    
+    print(f"Marking {len(rows_to_drop)} rows for removal (wrong statement_type for blank status duplicates)")
+    df_working = df_working.drop(rows_to_drop)
+    print(f"Rows after blank status resolution: {len(df_working)}")
+    print()
+    
+    # ========================================================================
+    # STEP 4: Check for remaining duplicates
+    # ========================================================================
+    print("STEP 4: Checking for remaining duplicates")
+    print("-" * 80)
+    
+    remaining_duplicates = df_working['s3_path'].value_counts()
+    remaining_duplicates = remaining_duplicates[remaining_duplicates > 1].index
+    print(f"Remaining duplicate s3_paths: {len(remaining_duplicates)}")
+    
+    if len(remaining_duplicates) > 0:
+        print(f"Total rows with remaining duplicates: {df_working['s3_path'].isin(remaining_duplicates).sum()}")
+    print()
+    
+    # ========================================================================
+    # STEP 5: Keep rows where status=1.0 for remaining duplicates
+    # ========================================================================
+    print("STEP 5: Resolving remaining duplicates by keeping status=1.0")
+    print("-" * 80)
+    
+    rows_to_drop = []
+    for s3_path in remaining_duplicates:
+        dup_rows = df_working[df_working['s3_path'] == s3_path]
+        has_status_1 = (dup_rows['status'] == 1.0).any()
+        
+        if has_status_1:
+            # Drop rows without status=1.0
+            for idx, row in dup_rows.iterrows():
+                if row['status'] != 1.0:
+                    rows_to_drop.append(idx)
+    
+    print(f"Marking {len(rows_to_drop)} rows for removal (don't have status=1.0)")
+    df_working = df_working.drop(rows_to_drop)
+    print(f"Rows after status=1.0 resolution: {len(df_working)}")
+    print()
+    
+    # ========================================================================
+    # STEP 6: Check for remaining duplicates again
+    # ========================================================================
+    print("STEP 6: Checking for remaining duplicates after status filter")
+    print("-" * 80)
+    
+    remaining_duplicates = df_working['s3_path'].value_counts()
+    remaining_duplicates = remaining_duplicates[remaining_duplicates > 1].index
+    print(f"Remaining duplicate s3_paths: {len(remaining_duplicates)}")
+    
+    if len(remaining_duplicates) > 0:
+        print(f"Total rows with remaining duplicates: {df_working['s3_path'].isin(remaining_duplicates).sum()}")
+        print("\nSample of remaining duplicates:")
+        for s3_path in list(remaining_duplicates)[:3]:
+            dup_rows = df_working[df_working['s3_path'] == s3_path]
+            print(f"  {s3_path}")
+            print(f"    Statement types: {dup_rows['statement_type'].unique()}")
+            print(f"    Report types: {dup_rows['report_type'].unique()}")
+            print(f"    Statuses: {dup_rows['status'].unique()}")
+    print()
+    
+    # ========================================================================
+    # STEP 7: Apply manual mapping for report_type
+    # ========================================================================
+    print("STEP 7: Applying manual report_type mapping")
+    print("-" * 80)
+    print(f"Manual mapping covers {len(correct_report_type_mapping)} s3_paths")
+    
+    rows_to_drop = []
+    for s3_path in remaining_duplicates:
+        if s3_path in correct_report_type_mapping:
+            correct_report_type = correct_report_type_mapping[s3_path]
+            dup_rows = df_working[df_working['s3_path'] == s3_path]
+            
+            for idx, row in dup_rows.iterrows():
+                if row['report_type'] != correct_report_type:
+                    rows_to_drop.append(idx)
+    
+    print(f"Marking {len(rows_to_drop)} rows for removal (wrong report_type per manual mapping)")
+    df_working = df_working.drop(rows_to_drop)
+    print(f"Rows after report_type mapping: {len(df_working)}")
+    print()
+    
+    # ========================================================================
+    # STEP 8: Handle true duplicates (identical in all checked fields)
+    # ========================================================================
+    print("STEP 8: Handling true duplicates (identical rows)")
+    print("-" * 80)
+    
+    remaining_duplicates = df_working['s3_path'].value_counts()
+    remaining_duplicates = remaining_duplicates[remaining_duplicates > 1]
+    
+    if len(remaining_duplicates) > 0:
+        print(f"Found {len(remaining_duplicates)} s3_paths that still have duplicates")
+        print(f"These are true duplicates (identical in all checked fields)")
+        print(f"Keeping first occurrence of each duplicate s3_path")
+        
+        # Count how many rows will be dropped
+        before_count = len(df_working)
+        df_working = df_working.drop_duplicates(subset='s3_path', keep='first')
+        after_count = len(df_working)
+        
+        print(f"Dropped {before_count - after_count} true duplicate rows")
+        print(f"Rows after removing true duplicates: {after_count}")
+    else:
+        print("No true duplicates found")
+    
+    print()
+    
+    # ========================================================================
+    # FINAL CHECK: Verify no duplicates remain
+    # ========================================================================
+    print("FINAL CHECK: Verifying no duplicates remain")
+    print("-" * 80)
+    
+    final_duplicates = df_working['s3_path'].value_counts()
+    final_duplicates = final_duplicates[final_duplicates > 1]
+    
+    if len(final_duplicates) > 0:
+        print(f"⚠️  WARNING: {len(final_duplicates)} s3_paths still have duplicates!")
+        print("\nThese need manual review:")
+        for s3_path in list(final_duplicates.index)[:5]:
+            dup_rows = df_working[df_working['s3_path'] == s3_path]
+            print(f"\n  {s3_path}")
+            print(f"    Statement types: {dup_rows['statement_type'].unique()}")
+            print(f"    Report types: {dup_rows['report_type'].unique()}")
+            print(f"    Statuses: {dup_rows['status'].unique()}")
+    else:
+        print("✓ SUCCESS: No duplicate s3_paths remain!")
+    
+    print()
+    print("="*80)
+    print(f"CLEANING COMPLETE")
+    print(f"Starting rows: {len(df)}")
+    print(f"Final rows: {len(df_working)}")
+    print(f"Rows dropped: {len(df) - len(df_working)}")
+    print("="*80 + "\n")
+    
+    return df_working
+
+def load_csv_to_bigquery(csv_source, table_ref):
+    """
+    Load CSV data to BigQuery.
+
+    Args:
+        csv_source: Either a file path (str) or a pandas DataFrame
+        table_ref: BigQuery table reference
+    """
     client = bigquery.Client(project=os.getenv("GOOGLE_PROJECT_ID"))
-    df = pd.read_csv(csv_path)
+
+    # Handle both DataFrame and file path inputs
+    if isinstance(csv_source, pd.DataFrame):
+        df = csv_source.copy()
+    elif isinstance(csv_source, str):
+        df = pd.read_csv(csv_source)
+    else:
+        raise ValueError("csv_source must be either a file path (str) or pandas DataFrame")
+
     df.columns = df.columns.str.lower().str.replace(' ', '_')
     
     print(f"Original data shape: {df.shape}")
+    
+    # Clean duplicate s3_paths (NEW STEP)
+    df = clean_duplicate_s3_paths(df)
     
     # Extract quarter information from period_detail based on statement_type
     print("Extracting quarter information from period_detail...")
@@ -230,23 +693,8 @@ def load_csv_to_bigquery(csv_path, table_ref):
         'pdf_folder_path': 'pdf_folder_path'
     }, inplace=True)
     
-    # Deduplicate records: keep unique records, prefer status=1 over blank for duplicates
-    print(f"Original records: {len(df)}")
-    
-    # Define grouping columns for duplicate detection
-    grouping_cols = ['symbol', 'period_end_date', 'report_type', 'consolidation_type']
-    
-    # Sort by grouping columns and status (putting status=1 first, blank/NaN last)
-    df_deduplicated = (df
-        .sort_values(grouping_cols + ['status'], na_position='last')
-        .drop_duplicates(subset=grouping_cols, keep='first')
-    )
-    
-    print(f"After deduplication: {len(df_deduplicated)}")
-    print(f"Removed {len(df) - len(df_deduplicated)} duplicate records")
-    
-    # Update df to use the deduplicated version
-    df = df_deduplicated
+    # Note: Deduplication already handled in clean_duplicate_s3_paths()
+    print(f"Records to load: {len(df)}")
     
     # Convert all string columns to string type to avoid mixed type issues
     string_columns = ['symbol', 'statement_type', 'period', 'period_detail', 'report_type', 'consolidation_type', 'status', 's3_path', 'pdf_folder_path']
@@ -255,29 +703,85 @@ def load_csv_to_bigquery(csv_path, table_ref):
         if col in df.columns:
             df[col] = df[col].astype(str)
     
-    # NEW: Derive period_end_date from a 'date' column when present
+    # NEW: Derive reference_date from a 'date' column when present
+    # reference_date is the actual statement date (e.g., Q1 Dec 31, 2015)
+    # period_end_date will be set later to the fiscal year end date
     if 'date' in df.columns:
-        print("Converting 'date' column to period_end_date in ISO format...")
-        df['period_end_date'] = pd.to_datetime(df['date'], errors='coerce')
-        sample_date = df[['date', 'period_end_date']].dropna().head(5)
+        print("Converting 'date' column to reference_date in ISO format...")
+        df['reference_date'] = pd.to_datetime(df['date'], errors='coerce')
+        sample_date = df[['date', 'reference_date']].dropna().head(5)
         print("Sample date conversions:")
         print(sample_date.to_string(index=False))
         # Drop the original 'date' column so it doesn't cause schema mismatch
         df.drop(columns=['date'], inplace=True)
     elif 'period_detail' in df.columns:
-        # Extract period_end_date from period_detail field
-        print("Extracting dates from period_detail field...")
-        df['period_end_date'] = df['period_detail'].apply(extract_date_from_period_detail)
+        # Extract reference_date from period_detail field
+        print("Extracting reference_date from period_detail field...")
+        df['reference_date'] = df['period_detail'].apply(extract_date_from_period_detail)
         # Convert to datetime for BigQuery
-        df['period_end_date'] = pd.to_datetime(df['period_end_date'], errors='coerce')
-        
+        df['reference_date'] = pd.to_datetime(df['reference_date'], errors='coerce')
+
         # Show some examples of the extraction
-        sample_data = df[['period_detail', 'period_end_date']].dropna().head(5)
+        sample_data = df[['period_detail', 'reference_date']].dropna().head(5)
         print("Sample date extractions:")
         print(sample_data.to_string(index=False))
     else:
-        print("Warning: neither 'date' nor 'period_detail' columns found in CSV; setting period_end_date to None")
-        df['period_end_date'] = None
+        print("Warning: neither 'date' nor 'period_detail' columns found in CSV; setting reference_date to None")
+        df['reference_date'] = None
+
+    # ========================================================================
+    # FISCAL YEAR ASSIGNMENT
+    # ========================================================================
+    print("\n" + "="*80)
+    print("FISCAL YEAR ASSIGNMENT")
+    print("="*80)
+
+    # Build fiscal year lookup table from audited statements
+    print("\nBuilding fiscal year lookup table from audited statements...")
+    fiscal_year_lookup = build_fiscal_year_lookup(df)
+    print(f"Lookup table rows: {len(fiscal_year_lookup)}")
+    print(f"Unique symbols in lookup: {fiscal_year_lookup['symbol'].nunique()}")
+
+    # Show sample lookup entries
+    print("\nSample lookup entries (first 5 symbols):")
+    sample_symbols = fiscal_year_lookup['symbol'].unique()[:5]
+    for symbol in sample_symbols:
+        symbol_rows = fiscal_year_lookup[fiscal_year_lookup['symbol'] == symbol].head(2)
+        for _, row in symbol_rows.iterrows():
+            print(f"  {symbol}: FY{row['fiscal_year']} ({row['start_range'].strftime('%Y-%m-%d')} to {row['end_range'].strftime('%Y-%m-%d')})")
+
+    # Assign fiscal year to all records
+    print("\nAssigning fiscal year to all records...")
+    df = assign_fiscal_year(df, fiscal_year_lookup)
+
+    # Show statistics
+    records_with_fy = df['fiscal_year'].notna().sum()
+    records_without_fy = df['fiscal_year'].isna().sum()
+    print(f"Records with fiscal_year assigned: {records_with_fy}")
+    print(f"Records without fiscal_year: {records_without_fy}")
+
+    # Show fiscal year distribution
+    print("\nFiscal year distribution:")
+    fy_dist = df['fiscal_year'].value_counts().sort_index()
+    print(fy_dist.head(10).to_string())
+
+    # Validate: Q1 in previous calendar year should have fiscal_year = next year
+    print("\n--- Validation: Cross-year Q1 assignments ---")
+    q1_records = df[df['period_quarter'] == 'Q1'].copy()
+    if not q1_records.empty:
+        q1_records['calendar_year'] = q1_records['reference_date'].dt.year
+        cross_year_q1 = q1_records[q1_records['calendar_year'] != q1_records['fiscal_year']]
+        print(f"Q1 records where calendar year differs from fiscal year: {len(cross_year_q1)}")
+        if not cross_year_q1.empty:
+            sample = cross_year_q1[['symbol', 'period_detail', 'reference_date', 'period_end_date', 'fiscal_year']].head(5)
+            print(sample.to_string(index=False))
+
+    # Show sample of new column structure
+    print("\n--- Sample: reference_date vs period_end_date ---")
+    sample_cols = df[['symbol', 'period_quarter', 'reference_date', 'period_end_date', 'fiscal_year']].dropna().head(10)
+    print(sample_cols.to_string(index=False))
+
+    print("="*80 + "\n")
 
     # NEW: keep only the columns that exist in the target schema to avoid schema mismatch errors
     schema_cols = [
@@ -285,8 +789,10 @@ def load_csv_to_bigquery(csv_path, table_ref):
         "statement_type",
         "period",
         "period_detail",
-        "period_end_date",
-        "period_quarter",  # New field from lu_period_mapping join
+        "reference_date",  # Actual statement date (e.g., Q1 Dec 31)
+        "period_end_date",  # Fiscal year end date (for backward compatibility)
+        "period_quarter",  # Q1, Q2, Q3, Q4, or FY
+        "fiscal_year",  # Calendar year of the fiscal year end
         "report_type",
         "consolidation_type",
         "status",
@@ -305,8 +811,10 @@ def load_csv_to_bigquery(csv_path, table_ref):
             bigquery.SchemaField("statement_type", "STRING"),
             bigquery.SchemaField("period", "STRING"),
             bigquery.SchemaField("period_detail", "STRING"),
-            bigquery.SchemaField("period_end_date", "DATE"),
-            bigquery.SchemaField("period_quarter", "STRING"),  # New field from lu_period_mapping join
+            bigquery.SchemaField("reference_date", "DATE"),  # Actual statement date (e.g., Q1 Dec 31)
+            bigquery.SchemaField("period_end_date", "DATE"),  # Fiscal year end date (for backward compatibility)
+            bigquery.SchemaField("period_quarter", "STRING"),  # Q1, Q2, Q3, Q4, or FY
+            bigquery.SchemaField("fiscal_year", "INTEGER"),  # Calendar year of the fiscal year end
             bigquery.SchemaField("report_type", "STRING"),
             bigquery.SchemaField("consolidation_type", "STRING"),
             bigquery.SchemaField("status", "STRING"),
@@ -324,13 +832,25 @@ def load_csv_to_bigquery(csv_path, table_ref):
 
 
 def main():
-    csv_path = "/Users/galbraithelroy/Documents/jse-data-extractor/fin_stat_meta/financial_statements_metadata_3_09_2025_with_ID - financial_statements_metadata_3_09_2025 - financial_statements_metadata_3_09_2025 (1).csv"
-    
+    # Google Sheets URL for the financial statements metadata
+    # This is the first worksheet (gid=1598524624)
+    google_sheets_url = "https://docs.google.com/spreadsheets/d/1KRZS4EAo7Rq-7ISmkG1QrdmgnAOGY5PCWoa5ApRLQ8g/edit?gid=1598524624#gid=1598524624"
+
+    # Fallback to local CSV if needed (uncomment to use local file instead)
+    # csv_path = "/Users/galbraithelroy/Documents/jse-data-extractor/fin_stat_meta/financial_statements_metadata_3_09_2025_with_ID - financial_statements_metadata_3_09_2025 - financial_statements_metadata_3_09_2025 (1).csv"
+
     # Create the table
     table_ref = create_bigquery_table()
 
-    # Load the CSV data
-    load_csv_to_bigquery(csv_path, table_ref)
+    # Fetch data from Google Sheets
+    try:
+        df = fetch_csv_from_google_sheets(google_sheets_url)
+        # Load the data to BigQuery
+        load_csv_to_bigquery(df, table_ref)
+    except Exception as e:
+        print(f"\n✗ Error: {e}")
+        print("\nTo use a local CSV file instead, uncomment the csv_path line in main() and pass it to load_csv_to_bigquery()")
+        raise
 
 if __name__ == "__main__":
     main() 
