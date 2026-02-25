@@ -282,7 +282,7 @@ def assign_fiscal_year(df, lookup_table):
 
     For each matching record, assigns:
     - fiscal_year: The calendar year of the fiscal year end (INTEGER)
-    - period_end_date: The actual fiscal year end date (DATE) - for backward compatibility
+    - period_end_date: The actual fiscal year end date (DATE) - only if not already set
 
     Args:
         df: DataFrame with all records (must have 'symbol' and 'reference_date')
@@ -293,9 +293,16 @@ def assign_fiscal_year(df, lookup_table):
     """
     df = df.copy()
 
-    # Initialize columns
+    # Initialize fiscal_year column
     df['fiscal_year'] = None
-    df['period_end_date'] = pd.NaT  # Fiscal year end date
+
+    # Initialize period_end_date only if it doesn't exist or is all null
+    # This preserves existing period_end_date values from the CSV
+    if 'period_end_date' not in df.columns:
+        df['period_end_date'] = pd.NaT
+    else:
+        # Convert to datetime if it's not already
+        df['period_end_date'] = pd.to_datetime(df['period_end_date'], dayfirst=True, errors='coerce')
 
     # Get unique symbols
     symbols = df['symbol'].unique()
@@ -323,7 +330,11 @@ def assign_fiscal_year(df, lookup_table):
 
             if not match.empty:
                 df.at[idx, 'fiscal_year'] = int(match.iloc[0]['fiscal_year'])
-                df.at[idx, 'period_end_date'] = match.iloc[0]['end_range']  # Fiscal year end date
+
+                # Only set period_end_date if it's currently null
+                # This preserves the actual statement dates from the CSV
+                if pd.isna(df.at[idx, 'period_end_date']):
+                    df.at[idx, 'period_end_date'] = match.iloc[0]['end_range']  # Fiscal year end date
 
     return df
 
@@ -597,6 +608,143 @@ def clean_duplicate_s3_paths(df):
     
     return df_working
 
+def transform_symbols(df):
+    """
+    Transform specific symbol values to their correct representations.
+
+    Transformations:
+    - 'KYNTR' -> 'KNTYR'
+    - 'MTL' -> 'MTLJA'
+    """
+    print("\n" + "="*80)
+    print("TRANSFORMING SYMBOLS")
+    print("="*80)
+
+    symbol_mapping = {
+        'KYNTR': 'KNTYR',
+        'MTL': 'MTLJA'
+    }
+
+    df_working = df.copy()
+
+    # Count records before transformation
+    records_to_transform = df_working['symbol'].isin(symbol_mapping.keys()).sum()
+    print(f"Found {records_to_transform} records to transform")
+
+    # Show before state
+    if records_to_transform > 0:
+        print("\nBefore transformation:")
+        for old_symbol, new_symbol in symbol_mapping.items():
+            count = (df_working['symbol'] == old_symbol).sum()
+            if count > 0:
+                print(f"  {old_symbol}: {count} records")
+
+    # Apply transformation
+    df_working['symbol'] = df_working['symbol'].replace(symbol_mapping)
+
+    # Show after state
+    if records_to_transform > 0:
+        print("\nAfter transformation:")
+        for old_symbol, new_symbol in symbol_mapping.items():
+            count = (df_working['symbol'] == new_symbol).sum()
+            if count > 0:
+                print(f"  {new_symbol}: {count} records (was {old_symbol})")
+
+    print("\n✓ Symbol transformation complete")
+    print("="*80 + "\n")
+
+    return df_working
+
+
+def validate_quarter_chronological_order(df):
+    """
+    Validate that fiscal quarters are in proper chronological order by reference_date.
+
+    For each (symbol, fiscal_year) group, checks that earlier quarters have earlier
+    dates than later quarters. Also checks that FY date >= latest Q-quarter date.
+
+    Returns a DataFrame of violations with columns:
+        symbol, fiscal_year, earlier_quarter, earlier_date, later_quarter, later_date, violation_type
+    """
+    # Filter to rows where fiscal_year, period_quarter, and reference_date are all non-null
+    mask = (
+        df['fiscal_year'].notna() &
+        df['period_quarter'].notna() &
+        df['reference_date'].notna()
+    )
+    filtered = df[mask].copy()
+
+    if filtered.empty:
+        return pd.DataFrame(columns=[
+            'symbol', 'fiscal_year', 'earlier_quarter', 'earlier_date',
+            'later_quarter', 'later_date', 'violation_type'
+        ])
+
+    # Ensure reference_date is datetime
+    filtered['reference_date'] = pd.to_datetime(filtered['reference_date'], errors='coerce')
+
+    # Group by (symbol, fiscal_year, period_quarter), take min(reference_date)
+    # This collapses multiple report types (IS, BS, CF) per quarter into one date
+    grouped = (
+        filtered
+        .groupby(['symbol', 'fiscal_year', 'period_quarter'])['reference_date']
+        .min()
+        .reset_index()
+    )
+
+    # Canonical quarter ordering
+    quarter_order = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'FY': 5}
+
+    violations = []
+
+    # For each (symbol, fiscal_year) group, check pairwise ordering
+    for (symbol, fiscal_year), group in grouped.groupby(['symbol', 'fiscal_year']):
+        # Only keep quarters we know about
+        group = group[group['period_quarter'].isin(quarter_order)].copy()
+        if len(group) < 2:
+            continue
+
+        # Sort by canonical order
+        group['sort_key'] = group['period_quarter'].map(quarter_order)
+        group = group.sort_values('sort_key')
+
+        quarters = group['period_quarter'].tolist()
+        dates = group['reference_date'].tolist()
+
+        # Check all consecutive pairs
+        for i in range(len(quarters) - 1):
+            q_earlier = quarters[i]
+            d_earlier = dates[i]
+            q_later = quarters[i + 1]
+            d_later = dates[i + 1]
+
+            if q_later == 'FY':
+                # FY date must be >= latest Q-quarter date
+                if d_later < d_earlier:
+                    violations.append({
+                        'symbol': symbol,
+                        'fiscal_year': int(fiscal_year),
+                        'earlier_quarter': q_earlier,
+                        'earlier_date': d_earlier,
+                        'later_quarter': q_later,
+                        'later_date': d_later,
+                        'violation_type': 'FY_BEFORE_QUARTER'
+                    })
+            else:
+                # Earlier quarter's date must be strictly less than later quarter's date
+                if d_earlier >= d_later:
+                    violations.append({
+                        'symbol': symbol,
+                        'fiscal_year': int(fiscal_year),
+                        'earlier_quarter': q_earlier,
+                        'earlier_date': d_earlier,
+                        'later_quarter': q_later,
+                        'later_date': d_later,
+                        'violation_type': 'QUARTER_ORDER'
+                    })
+
+    return pd.DataFrame(violations)
+
 def load_csv_to_bigquery(csv_source, table_ref):
     """
     Load CSV data to BigQuery.
@@ -621,7 +769,10 @@ def load_csv_to_bigquery(csv_source, table_ref):
     
     # Clean duplicate s3_paths (NEW STEP)
     df = clean_duplicate_s3_paths(df)
-    
+
+    # Transform symbols
+    df = transform_symbols(df)
+
     # Extract quarter information from period_detail based on statement_type
     print("Extracting quarter information from period_detail...")
     df['period_quarter'] = df.apply(extract_quarter_from_period_detail, axis=1)
@@ -703,17 +854,28 @@ def load_csv_to_bigquery(csv_source, table_ref):
         if col in df.columns:
             df[col] = df[col].astype(str)
     
-    # NEW: Derive reference_date from a 'date' column when present
+    # NEW: Derive reference_date from a 'date' or 'period_end_date' column when present
     # reference_date is the actual statement date (e.g., Q1 Dec 31, 2015)
-    # period_end_date will be set later to the fiscal year end date
+    # We'll preserve the original period_end_date and use fiscal year assignment to fill in missing values
     if 'date' in df.columns:
         print("Converting 'date' column to reference_date in ISO format...")
         df['reference_date'] = pd.to_datetime(df['date'], errors='coerce')
+        df['reference_date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
         sample_date = df[['date', 'reference_date']].dropna().head(5)
         print("Sample date conversions:")
         print(sample_date.to_string(index=False))
         # Drop the original 'date' column so it doesn't cause schema mismatch
         df.drop(columns=['date'], inplace=True)
+    elif 'period_end_date' in df.columns and df['period_end_date'].notna().any():
+        # IMPORTANT: Use existing period_end_date column as reference_date
+        # This preserves the actual statement dates from the CSV (31/3/2024, etc.)
+        print("Using existing 'period_end_date' column for reference_date...")
+        df['reference_date'] = pd.to_datetime(df['period_end_date'], dayfirst=True, errors='coerce')
+
+        # Show some examples
+        sample_data = df[['period_detail', 'period_end_date', 'reference_date']].dropna().head(5)
+        print("Sample date usage:")
+        print(sample_data.to_string(index=False))
     elif 'period_detail' in df.columns:
         # Extract reference_date from period_detail field
         print("Extracting reference_date from period_detail field...")
@@ -726,7 +888,7 @@ def load_csv_to_bigquery(csv_source, table_ref):
         print("Sample date extractions:")
         print(sample_data.to_string(index=False))
     else:
-        print("Warning: neither 'date' nor 'period_detail' columns found in CSV; setting reference_date to None")
+        print("Warning: no date columns found in CSV; setting reference_date to None")
         df['reference_date'] = None
 
     # ========================================================================
@@ -780,6 +942,15 @@ def load_csv_to_bigquery(csv_source, table_ref):
     print("\n--- Sample: reference_date vs period_end_date ---")
     sample_cols = df[['symbol', 'period_quarter', 'reference_date', 'period_end_date', 'fiscal_year']].dropna().head(10)
     print(sample_cols.to_string(index=False))
+
+    # Validate: Quarter chronological ordering
+    print("\n--- Validation: Quarter Chronological Ordering ---")
+    quarter_violations = validate_quarter_chronological_order(df)
+    if len(quarter_violations) > 0:
+        print(f"WARNING: Found {len(quarter_violations)} quarter ordering violations:")
+        print(quarter_violations.to_string(index=False))
+    else:
+        print("All quarters are in proper chronological order.")
 
     print("="*80 + "\n")
 
