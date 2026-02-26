@@ -331,10 +331,9 @@ def assign_fiscal_year(df, lookup_table):
             if not match.empty:
                 df.at[idx, 'fiscal_year'] = int(match.iloc[0]['fiscal_year'])
 
-                # Only set period_end_date if it's currently null
-                # This preserves the actual statement dates from the CSV
-                if pd.isna(df.at[idx, 'period_end_date']):
-                    df.at[idx, 'period_end_date'] = match.iloc[0]['end_range']  # Fiscal year end date
+                # Always set period_end_date to the fiscal year end date
+                # reference_date already holds the actual statement date (e.g., Q1 Dec 31)
+                df.at[idx, 'period_end_date'] = match.iloc[0]['end_range']  # Fiscal year end date
 
     return df
 
